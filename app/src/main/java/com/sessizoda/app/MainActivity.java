@@ -71,6 +71,7 @@ public final class MainActivity extends Activity {
     private boolean activityVisible;
     private boolean connected;
     private boolean connecting;
+    private boolean mediaSupported;
     private boolean notificationPermissionAsked;
     private String displayName = "";
     private int presence;
@@ -84,14 +85,16 @@ public final class MainActivity extends Activity {
                 boolean sessionConnected,
                 String sessionRoom,
                 String sessionName,
-                int sessionPresence
+                int sessionPresence,
+                boolean sessionMediaSupported
         ) {
             runOnUiThread(() -> applySessionState(
                     sessionConnecting,
                     sessionConnected,
                     sessionRoom,
                     sessionName,
-                    sessionPresence
+                    sessionPresence,
+                    sessionMediaSupported
             ));
         }
 
@@ -116,6 +119,7 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 connected = false;
                 connecting = false;
+                mediaSupported = false;
                 sendButton.setEnabled(false);
                 mediaButton.setEnabled(false);
                 connectionStatus.setText(R.string.status_disconnected);
@@ -126,7 +130,7 @@ public final class MainActivity extends Activity {
         @Override
         public void onTransferProgress(String status, boolean active) {
             runOnUiThread(() -> {
-                mediaButton.setEnabled(connected && !active);
+                mediaButton.setEnabled(connected && mediaSupported && !active);
                 if (active || (status != null && !status.isEmpty())) {
                     connectionStatus.setText(status);
                 } else {
@@ -161,6 +165,7 @@ public final class MainActivity extends Activity {
             chatService = null;
             connected = false;
             connecting = false;
+            mediaSupported = false;
             sendButton.setEnabled(false);
             mediaButton.setEnabled(false);
         }
@@ -289,12 +294,14 @@ public final class MainActivity extends Activity {
             boolean sessionConnected,
             String sessionRoom,
             String sessionName,
-            int sessionPresence
+            int sessionPresence,
+            boolean sessionMediaSupported
     ) {
         connecting = sessionConnecting;
         connected = sessionConnected;
         displayName = sessionName == null ? "" : sessionName;
         presence = sessionPresence;
+        mediaSupported = sessionMediaSupported;
         connectButton.setEnabled(!connecting && !connected);
 
         if (connected) {
@@ -302,7 +309,7 @@ public final class MainActivity extends Activity {
             chatPanel.setVisibility(View.VISIBLE);
             roomTitle.setText(sessionRoom);
             sendButton.setEnabled(true);
-            mediaButton.setEnabled(true);
+            mediaButton.setEnabled(mediaSupported);
             loginStatus.setText("");
             updatePresenceText();
             messageInput.requestFocus();
@@ -335,6 +342,14 @@ public final class MainActivity extends Activity {
     private void chooseMedia() {
         if (!connected) {
             Toast.makeText(this, "Bağlantı açık değil.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!mediaSupported) {
+            Toast.makeText(
+                    this,
+                    "Sunucu medya desteği için güncellenmemiş.",
+                    Toast.LENGTH_LONG
+            ).show();
             return;
         }
         Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT)
@@ -406,6 +421,7 @@ public final class MainActivity extends Activity {
         }
         connected = false;
         connecting = false;
+        mediaSupported = false;
         displayName = "";
         presence = 0;
         lastRenderedEventId = 0;

@@ -75,6 +75,7 @@ Sunucunun kendisi hiçbir `console` çıktısı, dosya, veritabanı veya mesaj k
 - Medya sunucuda veya harici depolamada tutulmaz. Yalnız o anda bağlı ve medya desteği bulunan cihazlara şifreli parçalar hâlinde iletilir.
 - Çevrimdışı kullanıcıya mesaj veya medya sonradan teslim edilmez.
 - Alınan medya yalnız uygulamanın geçici önbelleğinde açık hâle getirilir; odadan çıkınca silinir. Uygulama beklenmedik biçimde kapanırsa kalan geçici dosyalar sonraki başlangıçta temizlenir.
+- Uygulama, relay'in medya protokolünü katılım sırasında doğrular. Render eski sürümdeyse medya düğmesi devre dışı kalır; böylece yarım paket yüzünden oda bağlantısı kopmaz.
 
 ## 2. GitHub Actions ile APK alın
 
@@ -120,6 +121,7 @@ Tam anlamıyla “dünyanın hiçbir katmanında log yok” garantisi uygulama k
 - **Oda dolu:** Eski bağlantının kapanması en fazla yaklaşık 25 saniye sürebilir.
 - **Bildirim gelmiyor:** Android uygulama ayarlarından Sessiz Oda bildirim iznini ve pil kullanımında arka plan çalışmasını kontrol edin.
 - **Medya gitmiyor:** İki cihazın da güncel APK'yı kullandığını, o anda odaya bağlı olduğunu ve dosyanın boyut sınırını aşmadığını kontrol edin.
+- **“Sunucu eski sürümde” uyarısı:** Render'da **Manual Deploy → Deploy latest commit** çalıştırın. Ardından `/health` yanıtında `"protocol":2` ve `"media":true` bulunduğunu kontrol edin.
 - **APK güncellenmiyor:** Eski debug APK'yı kaldırıp yenisini kurun.
 
 ## Proje yapısı

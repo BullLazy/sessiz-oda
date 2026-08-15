@@ -14,7 +14,7 @@ import okhttp3.WebSocketListener;
 
 final class ChatClient {
     interface Listener {
-        void onJoined();
+        void onJoined(boolean mediaSupported);
 
         void onPresence(int count);
 
@@ -34,6 +34,7 @@ final class ChatClient {
 
     private volatile WebSocket webSocket;
     private volatile boolean manualClose;
+    private volatile boolean mediaSupported;
 
     ChatClient(String serverUrl, String roomId, String authProof, Listener listener) {
         this.roomId = roomId;
@@ -94,7 +95,11 @@ final class ChatClient {
 
     boolean sendCipher(String kind, String payload) {
         WebSocket socket = webSocket;
-        if (socket == null || terminated.get()) {
+        if (
+                socket == null ||
+                terminated.get() ||
+                ("media".equals(kind) && !mediaSupported)
+        ) {
             return false;
         }
         try {
@@ -130,7 +135,10 @@ final class ChatClient {
             String type = message.optString("type", "");
             switch (type) {
                 case "joined":
-                    listener.onJoined();
+                    mediaSupported =
+                            message.optInt("protocol", 1) >= 2 &&
+                            message.optInt("media", 0) == 1;
+                    listener.onJoined(mediaSupported);
                     break;
                 case "presence":
                     int count = message.optInt("count", 0);

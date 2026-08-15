@@ -58,7 +58,8 @@ public final class ChatService extends Service {
                 boolean connected,
                 String roomName,
                 String displayName,
-                int presence
+                int presence,
+                boolean mediaSupported
         );
 
         void onEvent(ChatEvent event);
@@ -92,6 +93,7 @@ public final class ChatService extends Service {
     private boolean appVisible;
     private volatile boolean connecting;
     private volatile boolean connected;
+    private volatile boolean mediaSupported;
     private int presence;
     private volatile int connectionGeneration;
     private long nextEventId = 1;
@@ -176,8 +178,14 @@ public final class ChatService extends Service {
     }
 
     void sendMedia(Uri uri) {
-        if (!connected || mediaSending.get()) {
-            emitError(mediaSending.get() ? "Bir medya zaten gönderiliyor." : "Bağlantı açık değil.");
+        if (!connected || !mediaSupported || mediaSending.get()) {
+            if (!connected) {
+                emitError("Bağlantı açık değil.");
+            } else if (!mediaSupported) {
+                emitError("Sunucu medya desteği için güncellenmemiş.");
+            } else {
+                emitError("Bir medya zaten gönderiliyor.");
+            }
             return;
         }
 
@@ -213,6 +221,7 @@ public final class ChatService extends Service {
         }
         connecting = false;
         connected = false;
+        mediaSupported = false;
         presence = 0;
         cryptoBox = null;
         displayName = "";
@@ -248,21 +257,29 @@ public final class ChatService extends Service {
             roomName = room;
             connecting = true;
             connected = false;
+            mediaSupported = false;
             presence = 0;
             emitState();
 
             int generation = ++connectionGeneration;
             chatClient = new ChatClient(server, roomId, proof, new ChatClient.Listener() {
                 @Override
-                public void onJoined() {
+                public void onJoined(boolean supportsMedia) {
                     mainHandler.post(() -> {
                         if (generation != connectionGeneration) {
                             return;
                         }
                         connecting = false;
                         connected = true;
+                        mediaSupported = supportsMedia;
                         updateForegroundNotification();
                         emitState();
+                        if (!supportsMedia) {
+                            addSystemEvent(
+                                    "Sunucu eski sürümde. Görsel/video için Render servisini " +
+                                    "son GitHub commit'iyle yeniden dağıtın."
+                            );
+                        }
                     });
                 }
 
@@ -320,7 +337,7 @@ public final class ChatService extends Service {
             switch (packet.type) {
                 case CryptoBox.DecryptedPacket.TEXT:
                     if (!"text".equals(kind)) {
-                        throw new GeneralSecurityException("Paket türü uyuşmuyor.");
+                        return;
                     }
                     mainHandler.post(() -> {
                         if (generation == connectionGeneration) {
@@ -336,19 +353,20 @@ public final class ChatService extends Service {
                     break;
                 case CryptoBox.DecryptedPacket.MEDIA_START:
                     if (!"media".equals(kind)) {
-                        throw new GeneralSecurityException("Paket türü uyuşmuyor.");
+                        return;
                     }
                     receiveMediaStart(generation, packet);
                     break;
                 case CryptoBox.DecryptedPacket.MEDIA_CHUNK:
                     if (!"media".equals(kind)) {
-                        throw new GeneralSecurityException("Paket türü uyuşmuyor.");
+                        Arrays.fill(packet.data, (byte) 0);
+                        return;
                     }
                     receiveMediaChunk(generation, packet);
                     break;
                 case CryptoBox.DecryptedPacket.MEDIA_END:
                     if (!"media".equals(kind)) {
-                        throw new GeneralSecurityException("Paket türü uyuşmuyor.");
+                        return;
                     }
                     receiveMediaEnd(generation, packet);
                     break;
@@ -640,6 +658,7 @@ public final class ChatService extends Service {
         boolean hadSession = connecting || connected;
         connecting = false;
         connected = false;
+        mediaSupported = false;
         presence = 0;
         chatClient = null;
         cryptoBox = null;
@@ -656,6 +675,7 @@ public final class ChatService extends Service {
     private void failBeforeJoin(String message) {
         connecting = false;
         connected = false;
+        mediaSupported = false;
         chatClient = null;
         cryptoBox = null;
         stopForeground(STOP_FOREGROUND_REMOVE);
@@ -672,7 +692,8 @@ public final class ChatService extends Service {
                     connected,
                     roomName,
                     displayName,
-                    presence
+                    presence,
+                    mediaSupported
             );
         }
     }

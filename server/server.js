@@ -6,6 +6,7 @@ const { TextDecoder } = require("node:util");
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const PROTOCOL_VERSION = 2;
 
 function boundedInteger(value, fallback, minimum, maximum) {
     const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -40,7 +41,7 @@ function createRelayServer(options = {}) {
 
         if (request.method === "GET" && pathname === "/health") {
             response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-            response.end('{"status":"ok"}');
+            response.end('{"status":"ok","protocol":2,"media":true}');
             return;
         }
 
@@ -307,7 +308,7 @@ function createRelayServer(options = {}) {
             client.roomKey = roomKey;
             client.mediaCapable = message.media === 1;
             room.add(client);
-            sendJson(client, { type: "joined" });
+            sendJson(client, { type: "joined", protocol: PROTOCOL_VERSION, media: 1 });
             broadcastPresence(room);
             return;
         }

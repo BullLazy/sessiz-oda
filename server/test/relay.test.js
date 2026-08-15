@@ -94,6 +94,7 @@ test("relay iletir, geçmişi tekrar oynatmaz ve oda sınırını uygular", asyn
     const health = await fetch(`${baseUrl.replace("ws://", "http://")}/health`);
     assert.equal(health.status, 200);
     assert.equal(health.headers.get("cache-control"), "no-store");
+    assert.deepEqual(await health.json(), { status: "ok", protocol: 2, media: true });
 
     const room = "a".repeat(64);
     const proof = "b".repeat(64);
@@ -105,8 +106,12 @@ test("relay iletir, geçmişi tekrar oynatmaz ve oda sınırını uygular", asyn
     sockets.push(first.socket, second.socket);
     first.socket.send(mediaJoin);
     second.socket.send(mediaJoin);
-    await first.inbox.next((message) => message.type === "joined");
-    await second.inbox.next((message) => message.type === "joined");
+    const firstJoined = await first.inbox.next((message) => message.type === "joined");
+    const secondJoined = await second.inbox.next((message) => message.type === "joined");
+    assert.equal(firstJoined.protocol, 2);
+    assert.equal(firstJoined.media, 1);
+    assert.equal(secondJoined.protocol, 2);
+    assert.equal(secondJoined.media, 1);
     await first.inbox.next((message) => message.type === "presence" && message.count === 2);
 
     const payload = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=";
@@ -133,4 +138,67 @@ test("relay iletir, geçmişi tekrar oynatmaz ve oda sınırını uygular", asyn
     fourth.socket.send(join);
     const refusal = await fourth.inbox.next((message) => message.type === "error");
     assert.equal(refusal.code, "room_full");
+});
+
+test("azami görsel büyüklüğündeki medya akışı bağlantıyı koparmaz", async (context) => {
+    const relay = createRelayServer({
+        maxRoomSize: 2,
+        heartbeatMs: 5_000,
+        joinTimeoutMs: 1_500
+    });
+    await new Promise((resolve, reject) => {
+        relay.once("error", reject);
+        relay.listen(0, "127.0.0.1", resolve);
+    });
+
+    const address = relay.address();
+    const url = `ws://127.0.0.1:${address.port}/chat`;
+    const first = await connect(url);
+    const second = await connect(url);
+    context.after(async () => {
+        first.socket.close();
+        second.socket.close();
+        relay.closeAll();
+        await new Promise((resolve) => relay.close(resolve));
+    });
+
+    const join = JSON.stringify({
+        type: "join",
+        room: "c".repeat(64),
+        proof: "d".repeat(64),
+        media: 1
+    });
+    first.socket.send(join);
+    second.socket.send(join);
+    await first.inbox.next((message) => message.type === "joined");
+    await second.inbox.next((message) => message.type === "joined");
+
+    const chunkPayload = "A".repeat(22_000);
+    const endPayload = "B".repeat(22_000);
+    const completed = second.inbox.next(
+        (message) => message.type === "cipher" && message.payload === endPayload,
+        10_000
+    );
+    for (let index = 0; index < 684; index += 1) {
+        first.socket.send(JSON.stringify({
+            type: "cipher",
+            kind: "media",
+            payload: chunkPayload
+        }));
+    }
+    first.socket.send(JSON.stringify({
+        type: "cipher",
+        kind: "media",
+        payload: endPayload
+    }));
+    await completed;
+
+    const textPayload = "VEVTVF9TT05SQVNJX01FU0FKX1BBS0VUSQ==";
+    first.socket.send(JSON.stringify({ type: "cipher", kind: "text", payload: textPayload }));
+    const deliveredText = await second.inbox.next(
+        (message) => message.type === "cipher" && message.payload === textPayload
+    );
+    assert.equal(deliveredText.kind, "text");
+    assert.equal(first.socket.readyState, WebSocket.OPEN);
+    assert.equal(second.socket.readyState, WebSocket.OPEN);
 });
