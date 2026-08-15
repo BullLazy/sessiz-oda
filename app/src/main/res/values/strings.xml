@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sessiz Oda</string>
+    <string name="subtitle">Geçmiş tutmayan, uçtan uca şifreli küçük sohbet odası</string>
+    <string name="label_name">Görünen ad</string>
+    <string name="hint_name">Örn. Deniz</string>
+    <string name="label_server">Sunucu adresi</string>
+    <string name="hint_server" translatable="false">wss://alan-adiniz.com/chat</string>
+    <string name="label_room">Oda kodu</string>
+    <string name="hint_room">Sadece arkadaşlarınızın bildiği kod</string>
+    <string name="label_secret">Ortak parola</string>
+    <string name="hint_secret">En az 12 karakter</string>
+    <string name="action_connect">Odaya gir</string>
+    <string name="privacy_note">Parola sunucuya gönderilmez. Uygulama kapanınca ekrandaki mesajlar silinir.</string>
+    <string name="status_connecting">Bağlanıyor…</string>
+    <string name="status_connected">Bağlı</string>
+    <plurals name="status_people">
+        <item quantity="one">%1$d kişi bağlı</item>
+        <item quantity="other">%1$d kişi bağlı</item>
+    </plurals>
+    <string name="status_disconnected">Bağlantı kesildi</string>
+    <string name="action_leave">Çık</string>
+    <string name="hint_message">Mesaj yaz…</string>
+    <string name="action_send">Gönder</string>
+    <string name="clipboard_label">Sessiz Oda mesajı</string>
+    <string name="message_copied">Mesaj kopyalandı.</string>
+    <string name="message_copy_failed">Mesaj kopyalanamadı.</string>
+    <string name="message_accessibility">%1$s, %3$s: %2$s</string>
+</resources>
