@@ -98,12 +98,13 @@ test("relay iletir, geçmişi tekrar oynatmaz ve oda sınırını uygular", asyn
     const room = "a".repeat(64);
     const proof = "b".repeat(64);
     const join = JSON.stringify({ type: "join", room, proof });
+    const mediaJoin = JSON.stringify({ type: "join", room, proof, media: 1 });
 
     const first = await connect(`${baseUrl}/chat`);
     const second = await connect(`${baseUrl}/chat`);
     sockets.push(first.socket, second.socket);
-    first.socket.send(join);
-    second.socket.send(join);
+    first.socket.send(mediaJoin);
+    second.socket.send(mediaJoin);
     await first.inbox.next((message) => message.type === "joined");
     await second.inbox.next((message) => message.type === "joined");
     await first.inbox.next((message) => message.type === "presence" && message.count === 2);
@@ -112,12 +113,20 @@ test("relay iletir, geçmişi tekrar oynatmaz ve oda sınırını uygular", asyn
     first.socket.send(JSON.stringify({ type: "cipher", payload }));
     const delivered = await second.inbox.next((message) => message.type === "cipher");
     assert.equal(delivered.payload, payload);
+    assert.equal(delivered.kind, "text");
 
     const third = await connect(`${baseUrl}/chat`);
     sockets.push(third.socket);
     third.socket.send(join);
     await third.inbox.next((message) => message.type === "joined");
     await third.inbox.expectNone((message) => message.type === "cipher");
+
+    first.socket.send(JSON.stringify({ type: "cipher", kind: "media", payload }));
+    const deliveredMedia = await second.inbox.next(
+        (message) => message.type === "cipher" && message.kind === "media"
+    );
+    assert.equal(deliveredMedia.payload, payload);
+    await third.inbox.expectNone((message) => message.type === "cipher" && message.kind === "media");
 
     const fourth = await connect(`${baseUrl}/chat`);
     sockets.push(fourth.socket);

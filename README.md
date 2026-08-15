@@ -13,6 +13,8 @@ Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygul
 - Mesajlarda cihazın saat biçimine uygun gönderim saati
 - Mesaja uzun basarak metni panoya kopyalama
 - Yazma alanının ekran klavyesinin üzerinde kalması
+- Uygulama arka plandayken içeriği göstermeyen “Yeni bir bildirim var” bildirimi
+- Bağlı oda üyeleri arasında uçtan uca şifreli görsel ve video aktarımı
 - Ekran görüntüsü ve son uygulamalar önizlemesinin Android tarafında engellenmesi
 - Sıfır harici Node.js paketiyle çalışan küçük WebSocket relay
 - Oda başına varsayılan en fazla 10 bağlantı ve basit hız sınırı
@@ -64,6 +66,16 @@ Kullanılabilen ortam değişkenleri:
 
 Sunucunun kendisi hiçbir `console` çıktısı, dosya, veritabanı veya mesaj kuyruğu oluşturmaz.
 
+## Bildirim ve medya davranışı
+
+- Android 13 ve üzerinde uygulama ilk bağlantıda bildirim izni ister.
+- Mesaj bildirimi göndereni, oda adını veya mesaj içeriğini göstermez; yalnız “Yeni bir bildirim var” yazar.
+- Bağlantının arka planda açık kalması için Android ayrıca düşük öncelikli “Odaya bağlı” hizmet bildirimi gösterir.
+- Görseller en fazla 8 MB, videolar en fazla 20 MB olabilir.
+- Medya sunucuda veya harici depolamada tutulmaz. Yalnız o anda bağlı ve medya desteği bulunan cihazlara şifreli parçalar hâlinde iletilir.
+- Çevrimdışı kullanıcıya mesaj veya medya sonradan teslim edilmez.
+- Alınan medya yalnız uygulamanın geçici önbelleğinde açık hâle getirilir; odadan çıkınca silinir. Uygulama beklenmedik biçimde kapanırsa kalan geçici dosyalar sonraki başlangıçta temizlenir.
+
 ## 2. GitHub Actions ile APK alın
 
 1. GitHub'da tercihen **private** bir depo oluşturun.
@@ -93,9 +105,10 @@ Görünen ad farklı olabilir. Yanlış parola giren kişi aynı oda kodunu kull
 - Mesaj metni ve görünen ad, telefonda şifrelenmeden önce yalnız RAM'dedir.
 - Sunucuya şifreli paket, oda özeti ve parola kanıtı gider. Düz metin parola gitmez.
 - Relay paketi mevcut oda üyelerine iletir ve hemen bırakır.
-- Çevrimdışı mesaj, geçmiş, kullanıcı hesabı ve bildirim yoktur.
-- Android uygulaması `SharedPreferences`, SQLite/Room, dosya kaydı, analitik, reklam veya crash-reporting SDK'sı kullanmaz.
-- Ekranda en fazla 150 mesaj yalnız RAM'de tutulur; oda terk edilince veya uygulama kapanınca temizlenir.
+- Çevrimdışı mesaj, geçmiş ve kullanıcı hesabı yoktur.
+- Android uygulaması `SharedPreferences`, SQLite/Room, kalıcı mesaj veritabanı, analitik, reklam veya crash-reporting SDK'sı kullanmaz.
+- Ekranda en fazla 150 sohbet olayı tutulur. Metinler yalnız RAM'dedir; alınan medya yalnız geçici uygulama önbelleğindedir. Oda terk edilince ikisi de temizlenir.
+- Medya aktarımında relay; içeriği, dosya adını ve MIME türünü okuyamaz fakat medya trafiği olduğunu, şifreli paket boyutlarını ve aktarım zamanını görebilir.
 
 Tam anlamıyla “dünyanın hiçbir katmanında log yok” garantisi uygulama koduyla verilemez. Android işletim sistemi, internet sağlayıcı, ters proxy veya barındırma firması bağlantı zamanı ve IP gibi teknik metaverileri kendi politikasına göre kaydedebilir. Kesin denetim gerekiyorsa relay kendi sunucunuzda çalıştırılmalı ve işletim sistemi/proxy erişim kayıtları ayrıca kapatılmalıdır. Mesaj içeriği yine uçtan uca şifrelidir.
 
@@ -105,6 +118,8 @@ Tam anlamıyla “dünyanın hiçbir katmanında log yok” garantisi uygulama k
 - **Bağlantı kurulmuyor:** Adresin `wss://` ile başladığını, `/chat` yolunu ve TLS sertifikasını kontrol edin.
 - **Herkes yalnız “1 kişi bağlı” görüyor:** Oda kodu veya ortak parola telefonlarda birebir aynı değildir.
 - **Oda dolu:** Eski bağlantının kapanması en fazla yaklaşık 25 saniye sürebilir.
+- **Bildirim gelmiyor:** Android uygulama ayarlarından Sessiz Oda bildirim iznini ve pil kullanımında arka plan çalışmasını kontrol edin.
+- **Medya gitmiyor:** İki cihazın da güncel APK'yı kullandığını, o anda odaya bağlı olduğunu ve dosyanın boyut sınırını aşmadığını kontrol edin.
 - **APK güncellenmiyor:** Eski debug APK'yı kaldırıp yenisini kurun.
 
 ## Proje yapısı

@@ -18,7 +18,7 @@ final class ChatClient {
 
         void onPresence(int count);
 
-        void onCipher(String payload);
+        void onCipher(String kind, String payload);
 
         void onError(String message);
 
@@ -58,6 +58,7 @@ final class ChatClient {
                     join.put("type", "join");
                     join.put("room", roomId);
                     join.put("proof", authProof);
+                    join.put("media", 1);
                     if (!socket.send(join.toString())) {
                         failProtocol("Sunucuya katılım isteği gönderilemedi.");
                     }
@@ -91,7 +92,7 @@ final class ChatClient {
         });
     }
 
-    boolean sendCipher(String payload) {
+    boolean sendCipher(String kind, String payload) {
         WebSocket socket = webSocket;
         if (socket == null || terminated.get()) {
             return false;
@@ -99,11 +100,17 @@ final class ChatClient {
         try {
             JSONObject message = new JSONObject();
             message.put("type", "cipher");
+            message.put("kind", kind);
             message.put("payload", payload);
             return socket.send(message.toString());
         } catch (JSONException exception) {
             return false;
         }
+    }
+
+    long queueSize() {
+        WebSocket socket = webSocket;
+        return socket == null ? 0 : socket.queueSize();
     }
 
     void close() {
@@ -127,14 +134,20 @@ final class ChatClient {
                     break;
                 case "presence":
                     int count = message.optInt("count", 0);
-                    if (count >= 0 && count <= 10) {
+                    if (count >= 0 && count <= 50) {
                         listener.onPresence(count);
                     }
                     break;
                 case "cipher":
+                    String kind = message.optString("kind", "text");
                     String payload = message.optString("payload", "");
-                    if (!payload.isEmpty() && payload.length() <= 12_000) {
-                        listener.onCipher(payload);
+                    int payloadLimit = "media".equals(kind) ? 32_000 : 12_000;
+                    if (
+                            ("text".equals(kind) || "media".equals(kind)) &&
+                            !payload.isEmpty() &&
+                            payload.length() <= payloadLimit
+                    ) {
+                        listener.onCipher(kind, payload);
                     }
                     break;
                 case "error":
@@ -156,7 +169,7 @@ final class ChatClient {
     private String mapServerError(String code) {
         switch (code) {
             case "room_full":
-                return "Bu oda dolu. En fazla üç kişi bağlanabilir.";
+                return "Bu oda dolu.";
             case "rate_limited":
                 return "Çok hızlı mesaj gönderildi. Birkaç saniye bekleyin.";
             case "join_required":

@@ -18,7 +18,7 @@ function boundedInteger(value, fallback, minimum, maximum) {
 function createRelayServer(options = {}) {
     const maxRoomSize = boundedInteger(options.maxRoomSize ?? process.env.MAX_ROOM_SIZE, 10, 2, 50);
     const maxConnections = boundedInteger(options.maxConnections ?? process.env.MAX_CONNECTIONS, 50, 3, 500);
-    const maxFrameBytes = boundedInteger(options.maxFrameBytes, 32_768, 4_096, 262_144);
+    const maxFrameBytes = boundedInteger(options.maxFrameBytes, 65_536, 4_096, 262_144);
     const heartbeatMs = boundedInteger(options.heartbeatMs, 25_000, 1_000, 120_000);
     const joinTimeoutMs = boundedInteger(options.joinTimeoutMs, 8_000, 1_000, 30_000);
     const rooms = new Map();
@@ -105,8 +105,15 @@ function createRelayServer(options = {}) {
             roomKey: null,
             alive: true,
             closed: false,
+            mediaCapable: false,
+            fragmentOpcode: null,
+            fragments: [],
+            fragmentBytes: 0,
             rateWindowStartedAt: Date.now(),
             rateCount: 0,
+            mediaWindowStartedAt: Date.now(),
+            mediaBytes: 0,
+            mediaFrames: 0,
             joinTimer: null
         };
         clients.add(client);
@@ -174,27 +181,12 @@ function createRelayServer(options = {}) {
     }
 
     function handleFrame(client, frame) {
-        if (!frame.fin) {
-            closeClient(client, 1003, "Fragmentation unsupported");
-            return;
-        }
-        if (frame.opcode >= 0x8 && frame.payload.length > 125) {
-            closeClient(client, 1002, "Invalid control frame");
-            return;
-        }
-
-        switch (frame.opcode) {
-            case 0x1: {
-                let text;
-                try {
-                    text = UTF8_DECODER.decode(frame.payload);
-                } catch {
-                    closeClient(client, 1007, "Invalid UTF-8");
-                    return;
-                }
-                handleTextMessage(client, text);
-                break;
+        if (frame.opcode >= 0x8) {
+            if (!frame.fin || frame.payload.length > 125) {
+                closeClient(client, 1002, "Invalid control frame");
+                return;
             }
+            switch (frame.opcode) {
             case 0x8:
                 sendFrame(client, 0x8, frame.payload.subarray(0, 125));
                 client.socket.end();
@@ -209,11 +201,66 @@ function createRelayServer(options = {}) {
             default:
                 closeClient(client, 1003, "Unsupported frame");
                 break;
+            }
+            return;
         }
+
+        if (frame.opcode === 0x0) {
+            if (client.fragmentOpcode === null) {
+                closeClient(client, 1002, "Unexpected continuation");
+                return;
+            }
+            client.fragments.push(frame.payload);
+            client.fragmentBytes += frame.payload.length;
+            if (client.fragmentBytes > maxFrameBytes) {
+                closeClient(client, 1009, "Message too large");
+                return;
+            }
+            if (frame.fin) {
+                const opcode = client.fragmentOpcode;
+                const payload = Buffer.concat(client.fragments, client.fragmentBytes);
+                client.fragmentOpcode = null;
+                client.fragments = [];
+                client.fragmentBytes = 0;
+                handleDataFrame(client, opcode, payload);
+            }
+            return;
+        }
+
+        if (frame.opcode !== 0x1 && frame.opcode !== 0x2) {
+            closeClient(client, 1003, "Unsupported frame");
+            return;
+        }
+        if (client.fragmentOpcode !== null) {
+            closeClient(client, 1002, "Fragment already open");
+            return;
+        }
+        if (frame.fin) {
+            handleDataFrame(client, frame.opcode, frame.payload);
+            return;
+        }
+        client.fragmentOpcode = frame.opcode;
+        client.fragments = [frame.payload];
+        client.fragmentBytes = frame.payload.length;
+    }
+
+    function handleDataFrame(client, opcode, payload) {
+        if (opcode !== 0x1) {
+            closeClient(client, 1003, "Binary messages unsupported");
+            return;
+        }
+        let text;
+        try {
+            text = UTF8_DECODER.decode(payload);
+        } catch {
+            closeClient(client, 1007, "Invalid UTF-8");
+            return;
+        }
+        handleTextMessage(client, text);
     }
 
     function handleTextMessage(client, text) {
-        if (text.length > 16_000) {
+        if (text.length > 40_000) {
             closeClient(client, 1009, "Message too large");
             return;
         }
@@ -258,6 +305,7 @@ function createRelayServer(options = {}) {
             client.joinTimer = null;
             client.joined = true;
             client.roomKey = roomKey;
+            client.mediaCapable = message.media === 1;
             room.add(client);
             sendJson(client, { type: "joined" });
             broadcastPresence(room);
@@ -269,19 +317,49 @@ function createRelayServer(options = {}) {
             return;
         }
 
-        const now = Date.now();
-        if (now - client.rateWindowStartedAt >= 10_000) {
-            client.rateWindowStartedAt = now;
-            client.rateCount = 0;
-        }
-        client.rateCount += 1;
-        if (client.rateCount > 15) {
-            sendJson(client, { type: "error", code: "rate_limited" });
-            closeClient(client, 1008, "Rate limited");
+        const kind = message.kind ?? "text";
+        if (kind !== "text" && kind !== "media") {
+            closeClient(client, 1008, "Invalid payload");
             return;
         }
 
-        if (message.payload.length < 24 || message.payload.length > 12_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(message.payload)) {
+        const now = Date.now();
+        if (kind === "text") {
+            if (now - client.rateWindowStartedAt >= 10_000) {
+                client.rateWindowStartedAt = now;
+                client.rateCount = 0;
+            }
+            client.rateCount += 1;
+            if (client.rateCount > 15) {
+                sendJson(client, { type: "error", code: "rate_limited" });
+                closeClient(client, 1008, "Rate limited");
+                return;
+            }
+        } else {
+            if (!client.mediaCapable) {
+                closeClient(client, 1008, "Media capability required");
+                return;
+            }
+            if (now - client.mediaWindowStartedAt >= 180_000) {
+                client.mediaWindowStartedAt = now;
+                client.mediaBytes = 0;
+                client.mediaFrames = 0;
+            }
+            client.mediaBytes += Buffer.byteLength(text, "utf8");
+            client.mediaFrames += 1;
+            if (client.mediaBytes > 48 * 1024 * 1024 || client.mediaFrames > 2_500) {
+                sendJson(client, { type: "error", code: "rate_limited" });
+                closeClient(client, 1008, "Media rate limited");
+                return;
+            }
+        }
+
+        const payloadLimit = kind === "media" ? 32_000 : 12_000;
+        if (
+            message.payload.length < 24 ||
+            message.payload.length > payloadLimit ||
+            !/^[A-Za-z0-9+/]+={0,2}$/.test(message.payload)
+        ) {
             closeClient(client, 1008, "Invalid payload");
             return;
         }
@@ -291,7 +369,12 @@ function createRelayServer(options = {}) {
             closeClient(client, 1011, "Room unavailable");
             return;
         }
-        broadcast(room, { type: "cipher", payload: message.payload });
+        const outgoing = { type: "cipher", kind, payload: message.payload };
+        if (kind === "media") {
+            broadcastMedia(room, outgoing);
+        } else {
+            broadcast(room, outgoing);
+        }
     }
 
     function broadcastPresence(room) {
@@ -302,6 +385,15 @@ function createRelayServer(options = {}) {
         const encoded = JSON.stringify(message);
         for (const member of room) {
             sendFrame(member, 0x1, Buffer.from(encoded, "utf8"));
+        }
+    }
+
+    function broadcastMedia(room, message) {
+        const encoded = Buffer.from(JSON.stringify(message), "utf8");
+        for (const member of room) {
+            if (member.mediaCapable) {
+                sendFrame(member, 0x1, encoded);
+            }
         }
     }
 
@@ -352,6 +444,9 @@ function createRelayServer(options = {}) {
         }
         clients.delete(client);
         client.buffer = Buffer.alloc(0);
+        client.fragments = [];
+        client.fragmentBytes = 0;
+        client.fragmentOpcode = null;
 
         if (client.roomKey) {
             const room = rooms.get(client.roomKey);

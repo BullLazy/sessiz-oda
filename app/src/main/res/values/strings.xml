@@ -11,9 +11,8 @@
     <string name="label_secret">Ortak parola</string>
     <string name="hint_secret">En az 12 karakter</string>
     <string name="action_connect">Odaya gir</string>
-    <string name="privacy_note">Parola sunucuya gönderilmez. Uygulama kapanınca ekrandaki mesajlar silinir.</string>
+    <string name="privacy_note">Parola sunucuya gönderilmez. Oturum kapatılınca mesajlar ve geçici medya silinir.</string>
     <string name="status_connecting">Bağlanıyor…</string>
-    <string name="status_connected">Bağlı</string>
     <plurals name="status_people">
         <item quantity="one">%1$d kişi bağlı</item>
         <item quantity="other">%1$d kişi bağlı</item>
@@ -22,8 +21,18 @@
     <string name="action_leave">Çık</string>
     <string name="hint_message">Mesaj yaz…</string>
     <string name="action_send">Gönder</string>
+    <string name="action_media">Görsel veya video seç</string>
+    <string name="media_button_symbol" translatable="false">+</string>
     <string name="clipboard_label">Sessiz Oda mesajı</string>
     <string name="message_copied">Mesaj kopyalandı.</string>
     <string name="message_copy_failed">Mesaj kopyalanamadı.</string>
     <string name="message_accessibility">%1$s, %3$s: %2$s</string>
+    <string name="media_image_description">Gönderilen görsel; büyütmek için dokunun</string>
+    <string name="media_video_description">Gönderilen video; oynatmak için dokunun</string>
+    <string name="notification_channel_connection">Sohbet bağlantısı</string>
+    <string name="notification_channel_connection_description">Arka planda oda bağlantısını açık tutar</string>
+    <string name="notification_channel_messages">Yeni mesajlar</string>
+    <string name="notification_channel_messages_description">Mesaj içeriğini göstermeyen yeni ileti bildirimleri</string>
+    <string name="notification_connected">Odaya bağlı</string>
+    <string name="notification_new">Yeni bir bildirim var</string>
 </resources>

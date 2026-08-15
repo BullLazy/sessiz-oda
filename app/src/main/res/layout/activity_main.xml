@@ -276,10 +276,25 @@
             android:paddingEnd="10dp"
             android:paddingBottom="10dp">
 
+            <Button
+                android:id="@+id/media_button"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:background="@drawable/secondary_button"
+                android:contentDescription="@string/action_media"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:text="@string/media_button_symbol"
+                android:textAllCaps="false"
+                android:textColor="@color/primary_dark"
+                android:textSize="23sp"
+                android:textStyle="bold" />
+
             <EditText
                 android:id="@+id/message_input"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
                 android:layout_weight="1"
                 android:background="@drawable/input_background"
                 android:hint="@string/hint_message"
@@ -294,10 +309,11 @@
 
             <Button
                 android:id="@+id/send_button"
-                android:layout_width="94dp"
+                android:layout_width="82dp"
                 android:layout_height="48dp"
                 android:layout_marginStart="8dp"
                 android:background="@drawable/primary_button"
+                android:enabled="false"
                 android:text="@string/action_send"
                 android:textAllCaps="false"
                 android:textColor="#FFFFFF"
