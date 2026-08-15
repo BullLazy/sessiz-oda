@@ -1,0 +1,15 @@
+{
+  "name": "sessiz-oda-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bellekte çalışan, mesaj geçmişi tutmayan WebSocket relay",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}
+

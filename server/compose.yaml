@@ -1,0 +1,16 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      MAX_ROOM_SIZE: "3"
+      MAX_CONNECTIONS: "50"
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+
