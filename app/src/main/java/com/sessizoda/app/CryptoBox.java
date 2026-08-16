@@ -22,14 +22,14 @@ import javax.crypto.spec.SecretKeySpec;
 
 final class CryptoBox {
     static final int MEDIA_CHUNK_BYTES = 12 * 1024;
-    static final long MAX_IMAGE_BYTES = 8L * 1024L * 1024L;
-    static final long MAX_VIDEO_BYTES = 20L * 1024L * 1024L;
+    static final long MAX_IMAGE_BYTES = 100L * 1024L * 1024L;
+    static final long MAX_VIDEO_BYTES = 500L * 1024L * 1024L;
 
     private static final int KEY_BITS = 256;
     private static final int PBKDF2_ITERATIONS = 210_000;
     private static final int NONCE_BYTES = 12;
     private static final int GCM_TAG_BITS = 128;
-    private static final int MAX_MEDIA_CHUNKS = 4_096;
+    private static final int MAX_MEDIA_CHUNKS = 50_000;
     private static final long MAX_CLOCK_DIFFERENCE_MS = 7L * 24L * 60L * 60L * 1_000L;
     private static final SecureRandom RANDOM = new SecureRandom();
 
@@ -158,13 +158,16 @@ final class CryptoBox {
                     String mimeType = clearText.getString("mime");
                     String name = clearText.getString("name");
                     long size = clearText.getLong("size");
+                    long mediaLimit = mimeType.startsWith("image/")
+                            ? MAX_IMAGE_BYTES
+                            : MAX_VIDEO_BYTES;
                     if (
                             (!mimeType.startsWith("image/") && !mimeType.startsWith("video/")) ||
                             mimeType.length() > 80 ||
                             name.trim().isEmpty() ||
                             name.length() > 120 ||
                             size <= 0 ||
-                            size > MAX_VIDEO_BYTES
+                            size > mediaLimit
                     ) {
                         throw new GeneralSecurityException("Medya bilgisi geçersiz.");
                     }

@@ -6,7 +6,7 @@ const { TextDecoder } = require("node:util");
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 
 function boundedInteger(value, fallback, minimum, maximum) {
     const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -17,10 +17,10 @@ function boundedInteger(value, fallback, minimum, maximum) {
 }
 
 function createRelayServer(options = {}) {
-    const maxRoomSize = boundedInteger(options.maxRoomSize ?? process.env.MAX_ROOM_SIZE, 10, 2, 50);
-    const maxConnections = boundedInteger(options.maxConnections ?? process.env.MAX_CONNECTIONS, 50, 3, 500);
+    const maxRoomSize = boundedInteger(options.maxRoomSize ?? process.env.MAX_ROOM_SIZE, 50, 2, 100);
+    const maxConnections = boundedInteger(options.maxConnections ?? process.env.MAX_CONNECTIONS, 500, 3, 2_000);
     const maxFrameBytes = boundedInteger(options.maxFrameBytes, 65_536, 4_096, 262_144);
-    const heartbeatMs = boundedInteger(options.heartbeatMs, 25_000, 1_000, 120_000);
+    const heartbeatMs = boundedInteger(options.heartbeatMs, 15_000, 1_000, 120_000);
     const joinTimeoutMs = boundedInteger(options.joinTimeoutMs, 8_000, 1_000, 30_000);
     const rooms = new Map();
     const clients = new Set();
@@ -41,7 +41,7 @@ function createRelayServer(options = {}) {
 
         if (request.method === "GET" && pathname === "/health") {
             response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-            response.end('{"status":"ok","protocol":2,"media":true}');
+            response.end('{"status":"ok","protocol":3,"media":true,"notifications":true}');
             return;
         }
 
@@ -103,18 +103,19 @@ function createRelayServer(options = {}) {
             socket,
             buffer: Buffer.alloc(0),
             joined: false,
+            mode: null,
             roomKey: null,
+            watchRoomKeys: new Set(),
+            clientId: null,
             alive: true,
             closed: false,
             mediaCapable: false,
             fragmentOpcode: null,
             fragments: [],
             fragmentBytes: 0,
-            rateWindowStartedAt: Date.now(),
-            rateCount: 0,
-            mediaWindowStartedAt: Date.now(),
-            mediaBytes: 0,
-            mediaFrames: 0,
+            lastLegacyMediaActivityAt: 0,
+            waitingForDrain: new Set(),
+            drainSources: new Set(),
             joinTimer: null
         };
         clients.add(client);
@@ -128,6 +129,7 @@ function createRelayServer(options = {}) {
         client.joinTimer.unref();
 
         socket.on("data", (chunk) => handleSocketData(client, chunk));
+        socket.on("drain", () => releaseDrainTarget(client));
         socket.on("close", () => cleanupClient(client));
         socket.on("error", () => cleanupClient(client));
 
@@ -142,6 +144,10 @@ function createRelayServer(options = {}) {
 
     const heartbeat = setInterval(() => {
         for (const client of clients) {
+            if (client.waitingForDrain.size > 0) {
+                client.alive = true;
+                continue;
+            }
             if (!client.alive) {
                 client.socket.destroy();
                 cleanupClient(client);
@@ -173,6 +179,9 @@ function createRelayServer(options = {}) {
                 client.buffer = client.buffer.subarray(frame.bytesConsumed);
                 handleFrame(client, frame);
                 if (client.closed) {
+                    return;
+                }
+                if (client.waitingForDrain.size > 0) {
                     return;
                 }
             }
@@ -275,6 +284,10 @@ function createRelayServer(options = {}) {
         }
 
         if (!client.joined) {
+            if (message.type === "monitor") {
+                handleMonitorJoin(client, message);
+                return;
+            }
             if (
                 message.type !== "join" ||
                 typeof message.room !== "string" ||
@@ -288,15 +301,19 @@ function createRelayServer(options = {}) {
             }
 
             const roomKey = `${message.room}.${message.proof}`;
-            let room = rooms.get(roomKey);
-            if (!room) {
-                room = new Set();
-                rooms.set(roomKey, room);
-            }
-            if (room.size >= maxRoomSize) {
-                if (room.size === 0) {
-                    rooms.delete(roomKey);
+            const room = getOrCreateRoom(roomKey, message.room);
+            const clientId = validClientId(message.client) ? message.client : null;
+            if (clientId !== null) {
+                for (const previous of [...room.members]) {
+                    if (previous !== client && previous.clientId === clientId) {
+                        room.members.delete(previous);
+                        previous.roomKey = null;
+                        closeClient(previous, 4000, "Session replaced");
+                    }
                 }
+            }
+            if (room.members.size >= maxRoomSize) {
+                maybeDeleteRoom(roomKey, room);
                 sendJson(client, { type: "error", code: "room_full" });
                 closeClient(client, 1008, "Room full");
                 return;
@@ -305,15 +322,26 @@ function createRelayServer(options = {}) {
             clearTimeout(client.joinTimer);
             client.joinTimer = null;
             client.joined = true;
+            client.mode = "member";
             client.roomKey = roomKey;
+            client.clientId = clientId;
             client.mediaCapable = message.media === 1;
-            room.add(client);
-            sendJson(client, { type: "joined", protocol: PROTOCOL_VERSION, media: 1 });
+            room.members.add(client);
+            sendJson(client, {
+                type: "joined",
+                protocol: PROTOCOL_VERSION,
+                media: 1,
+                notifications: 1
+            });
             broadcastPresence(room);
             return;
         }
 
-        if (message.type !== "cipher" || typeof message.payload !== "string") {
+        if (
+            client.mode !== "member" ||
+            message.type !== "cipher" ||
+            typeof message.payload !== "string"
+        ) {
             closeClient(client, 1008, "Invalid message");
             return;
         }
@@ -324,35 +352,21 @@ function createRelayServer(options = {}) {
             return;
         }
 
-        const now = Date.now();
-        if (kind === "text") {
-            if (now - client.rateWindowStartedAt >= 10_000) {
-                client.rateWindowStartedAt = now;
-                client.rateCount = 0;
-            }
-            client.rateCount += 1;
-            if (client.rateCount > 15) {
-                sendJson(client, { type: "error", code: "rate_limited" });
-                closeClient(client, 1008, "Rate limited");
-                return;
-            }
-        } else {
-            if (!client.mediaCapable) {
-                closeClient(client, 1008, "Media capability required");
-                return;
-            }
-            if (now - client.mediaWindowStartedAt >= 180_000) {
-                client.mediaWindowStartedAt = now;
-                client.mediaBytes = 0;
-                client.mediaFrames = 0;
-            }
-            client.mediaBytes += Buffer.byteLength(text, "utf8");
-            client.mediaFrames += 1;
-            if (client.mediaBytes > 48 * 1024 * 1024 || client.mediaFrames > 2_500) {
-                sendJson(client, { type: "error", code: "rate_limited" });
-                closeClient(client, 1008, "Media rate limited");
-                return;
-            }
+        if (kind === "media" && !client.mediaCapable) {
+            closeClient(client, 1008, "Media capability required");
+            return;
+        }
+
+        const stage = message.stage;
+        if (
+            kind === "media" &&
+            stage !== undefined &&
+            stage !== "start" &&
+            stage !== "chunk" &&
+            stage !== "end"
+        ) {
+            closeClient(client, 1008, "Invalid media stage");
+            return;
         }
 
         const payloadLimit = kind === "media" ? 32_000 : 12_000;
@@ -372,28 +386,150 @@ function createRelayServer(options = {}) {
         }
         const outgoing = { type: "cipher", kind, payload: message.payload };
         if (kind === "media") {
-            broadcastMedia(room, outgoing);
+            broadcastMedia(room, outgoing, client);
         } else {
-            broadcast(room, outgoing);
+            broadcastMembers(room, outgoing, client);
+        }
+        broadcastActivity(room, client, kind, stage);
+    }
+
+    function handleMonitorJoin(client, message) {
+        if (
+            !validClientId(message.client) ||
+            !Array.isArray(message.rooms) ||
+            message.rooms.length < 1 ||
+            message.rooms.length > 30
+        ) {
+            sendJson(client, { type: "error", code: "join_required" });
+            closeClient(client, 1008, "Monitor join required");
+            return;
+        }
+
+        const subscriptions = new Map();
+        for (const entry of message.rooms) {
+            if (
+                entry === null ||
+                typeof entry !== "object" ||
+                typeof entry.room !== "string" ||
+                typeof entry.proof !== "string" ||
+                !/^[a-f0-9]{64}$/.test(entry.room) ||
+                !/^[a-f0-9]{64}$/.test(entry.proof)
+            ) {
+                sendJson(client, { type: "error", code: "join_required" });
+                closeClient(client, 1008, "Invalid monitor room");
+                return;
+            }
+            subscriptions.set(`${entry.room}.${entry.proof}`, entry.room);
+        }
+
+        for (const previous of [...clients]) {
+            if (
+                previous !== client &&
+                previous.mode === "monitor" &&
+                previous.clientId === message.client
+            ) {
+                closeClient(previous, 4000, "Monitor replaced");
+            }
+        }
+
+        clearTimeout(client.joinTimer);
+        client.joinTimer = null;
+        client.joined = true;
+        client.mode = "monitor";
+        client.clientId = message.client;
+        for (const [roomKey, roomId] of subscriptions) {
+            const room = getOrCreateRoom(roomKey, roomId);
+            room.monitors.add(client);
+            client.watchRoomKeys.add(roomKey);
+        }
+        sendJson(client, {
+            type: "joined",
+            mode: "monitor",
+            protocol: PROTOCOL_VERSION,
+            notifications: 1
+        });
+    }
+
+    function validClientId(value) {
+        return typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
+    }
+
+    function getOrCreateRoom(roomKey, roomId) {
+        let room = rooms.get(roomKey);
+        if (!room) {
+            room = { roomId, members: new Set(), monitors: new Set() };
+            rooms.set(roomKey, room);
+        }
+        return room;
+    }
+
+    function maybeDeleteRoom(roomKey, room) {
+        if (room.members.size === 0 && room.monitors.size === 0) {
+            rooms.delete(roomKey);
         }
     }
 
     function broadcastPresence(room) {
-        broadcast(room, { type: "presence", count: room.size });
+        broadcastMembers(room, { type: "presence", count: room.members.size });
     }
 
-    function broadcast(room, message) {
-        const encoded = JSON.stringify(message);
-        for (const member of room) {
-            sendFrame(member, 0x1, Buffer.from(encoded, "utf8"));
+    function broadcastMembers(room, message, source = null) {
+        const encoded = Buffer.from(JSON.stringify(message), "utf8");
+        for (const member of room.members) {
+            if (!sendFrame(member, 0x1, encoded) && source !== null) {
+                pauseSourceForTarget(source, member);
+            }
         }
     }
 
-    function broadcastMedia(room, message) {
+    function broadcastMedia(room, message, source) {
         const encoded = Buffer.from(JSON.stringify(message), "utf8");
-        for (const member of room) {
+        for (const member of room.members) {
             if (member.mediaCapable) {
-                sendFrame(member, 0x1, encoded);
+                if (!sendFrame(member, 0x1, encoded)) {
+                    pauseSourceForTarget(source, member);
+                }
+            }
+        }
+    }
+
+    function pauseSourceForTarget(source, target) {
+        if (source.closed || target.closed || source.waitingForDrain.has(target)) {
+            return;
+        }
+        source.waitingForDrain.add(target);
+        target.drainSources.add(source);
+        source.socket.pause();
+    }
+
+    function releaseDrainTarget(target) {
+        for (const source of [...target.drainSources]) {
+            target.drainSources.delete(source);
+            source.waitingForDrain.delete(target);
+            if (!source.closed && source.waitingForDrain.size === 0) {
+                source.socket.resume();
+                if (source.buffer.length > 0) {
+                    handleSocketData(source, Buffer.alloc(0));
+                }
+            }
+        }
+    }
+
+    function broadcastActivity(room, source, kind, stage) {
+        if (kind === "media") {
+            if (stage !== undefined && stage !== "start") {
+                return;
+            }
+            const now = Date.now();
+            if (stage === undefined && now - source.lastLegacyMediaActivityAt < 10_000) {
+                return;
+            }
+            source.lastLegacyMediaActivityAt = now;
+        }
+        const activity = { type: "activity", room: room.roomId };
+        for (const monitor of room.monitors) {
+            if (source.clientId === null || monitor.clientId !== source.clientId) {
+                sendJson(monitor, activity);
             }
         }
     }
@@ -404,13 +540,14 @@ function createRelayServer(options = {}) {
 
     function sendFrame(client, opcode, payload) {
         if (client.closed || !client.socket.writable) {
-            return;
+            return true;
         }
         try {
-            client.socket.write(encodeServerFrame(opcode, payload));
+            return client.socket.write(encodeServerFrame(opcode, payload));
         } catch {
             client.socket.destroy();
             cleanupClient(client);
+            return true;
         }
     }
 
@@ -449,18 +586,32 @@ function createRelayServer(options = {}) {
         client.fragmentBytes = 0;
         client.fragmentOpcode = null;
 
+        for (const target of client.waitingForDrain) {
+            target.drainSources.delete(client);
+        }
+        client.waitingForDrain.clear();
+        releaseDrainTarget(client);
+
         if (client.roomKey) {
-            const room = rooms.get(client.roomKey);
+            const roomKey = client.roomKey;
+            const room = rooms.get(roomKey);
             if (room) {
-                room.delete(client);
-                if (room.size === 0) {
-                    rooms.delete(client.roomKey);
-                } else {
+                const removed = room.members.delete(client);
+                if (removed && room.members.size > 0) {
                     broadcastPresence(room);
                 }
+                maybeDeleteRoom(roomKey, room);
             }
             client.roomKey = null;
         }
+        for (const roomKey of client.watchRoomKeys) {
+            const room = rooms.get(roomKey);
+            if (room) {
+                room.monitors.delete(client);
+                maybeDeleteRoom(roomKey, room);
+            }
+        }
+        client.watchRoomKeys.clear();
     }
 
     server.closeAll = () => {

@@ -14,7 +14,7 @@ import okhttp3.WebSocketListener;
 
 final class ChatClient {
     interface Listener {
-        void onJoined(boolean mediaSupported);
+        void onJoined(boolean mediaSupported, boolean notificationSupported);
 
         void onPresence(int count);
 
@@ -27,6 +27,7 @@ final class ChatClient {
 
     private final String roomId;
     private final String authProof;
+    private final String clientId;
     private final Listener listener;
     private final OkHttpClient httpClient;
     private final Request request;
@@ -36,9 +37,16 @@ final class ChatClient {
     private volatile boolean manualClose;
     private volatile boolean mediaSupported;
 
-    ChatClient(String serverUrl, String roomId, String authProof, Listener listener) {
+    ChatClient(
+            String serverUrl,
+            String roomId,
+            String authProof,
+            String clientId,
+            Listener listener
+    ) {
         this.roomId = roomId;
         this.authProof = authProof;
+        this.clientId = clientId;
         this.listener = listener;
         this.httpClient = new OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
@@ -59,6 +67,7 @@ final class ChatClient {
                     join.put("type", "join");
                     join.put("room", roomId);
                     join.put("proof", authProof);
+                    join.put("client", clientId);
                     join.put("media", 1);
                     if (!socket.send(join.toString())) {
                         failProtocol("Sunucuya katılım isteği gönderilemedi.");
@@ -94,6 +103,14 @@ final class ChatClient {
     }
 
     boolean sendCipher(String kind, String payload) {
+        return sendCipher(kind, null, payload);
+    }
+
+    boolean sendMediaCipher(String stage, String payload) {
+        return sendCipher("media", stage, payload);
+    }
+
+    private boolean sendCipher(String kind, String stage, String payload) {
         WebSocket socket = webSocket;
         if (
                 socket == null ||
@@ -106,6 +123,9 @@ final class ChatClient {
             JSONObject message = new JSONObject();
             message.put("type", "cipher");
             message.put("kind", kind);
+            if (stage != null) {
+                message.put("stage", stage);
+            }
             message.put("payload", payload);
             return socket.send(message.toString());
         } catch (JSONException exception) {
@@ -135,14 +155,18 @@ final class ChatClient {
             String type = message.optString("type", "");
             switch (type) {
                 case "joined":
+                    int protocol = message.optInt("protocol", 1);
                     mediaSupported =
-                            message.optInt("protocol", 1) >= 2 &&
+                            protocol >= 2 &&
                             message.optInt("media", 0) == 1;
-                    listener.onJoined(mediaSupported);
+                    boolean notificationSupported =
+                            protocol >= 3 &&
+                            message.optInt("notifications", 0) == 1;
+                    listener.onJoined(mediaSupported, notificationSupported);
                     break;
                 case "presence":
                     int count = message.optInt("count", 0);
-                    if (count >= 0 && count <= 50) {
+                    if (count >= 0 && count <= 100) {
                         listener.onPresence(count);
                     }
                     break;
@@ -159,10 +183,13 @@ final class ChatClient {
                     }
                     break;
                 case "error":
-                    listener.onError(mapServerError(message.optString("code", "")));
-                    WebSocket socket = webSocket;
-                    if (socket != null) {
-                        socket.close(1008, "Sunucu isteği reddetti");
+                    String code = message.optString("code", "");
+                    listener.onError(mapServerError(code));
+                    if (isFatalServerError(code)) {
+                        WebSocket socket = webSocket;
+                        if (socket != null) {
+                            socket.close(1008, "Sunucu isteği reddetti");
+                        }
                     }
                     break;
                 default:
@@ -179,12 +206,20 @@ final class ChatClient {
             case "room_full":
                 return "Bu oda dolu.";
             case "rate_limited":
-                return "Çok hızlı mesaj gönderildi. Birkaç saniye bekleyin.";
+                return "Sunucu yoğunluğu nedeniyle bir paket atlandı; bağlantı açık kaldı.";
+            case "session_replaced":
+                return "Bu cihazdaki eski bağlantının yerini yeni oturum aldı.";
             case "join_required":
                 return "Sunucu katılım isteğini kabul etmedi.";
             default:
                 return "Sunucu isteği reddetti.";
         }
+    }
+
+    private boolean isFatalServerError(String code) {
+        return "room_full".equals(code) ||
+                "join_required".equals(code) ||
+                "session_replaced".equals(code);
     }
 
     private void failProtocol(String message) {

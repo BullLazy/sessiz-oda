@@ -19,15 +19,20 @@ Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygul
 - Yazma alanının ekran klavyesinin üzerinde kalması
 - Tek karakterli iletilerde de ad, mesaj ve saati düzgün gösteren sabit genişlikte balon
 - Telefon yatay veya dikey çevrildiğinde açık oturumun korunması
-- Uygulama arka plandayken içeriği göstermeyen “Yeni bir bildirim var” bildirimi
+- Uygulama arka planda veya son uygulamalardan kapatılmışken kayıtlı odalar için içeriği göstermeyen bildirim
 - Bağlı oda üyeleri arasında uçtan uca şifreli görsel ve video aktarımı
+- 100 MB görsel ve 500 MB video üst sınırı; medya aktarılırken metin mesajlarının beklemeden ilerlemesi
+- Yoğun mesaj veya medya trafiğinde kullanıcıyı odadan atan hız/MB zaman aşımının kaldırılması
+- Aynı cihaz yeniden bağlandığında eski oturumun anında değiştirilmesi ve hayalet kişi sayısının önlenmesi
 - Ekran görüntüsü ve son uygulamalar önizlemesinin Android tarafında engellenmesi
 - Sıfır harici Node.js paketiyle çalışan küçük WebSocket relay
-- Oda başına varsayılan en fazla 10 bağlantı ve basit hız sınırı
+- Oda başına varsayılan en fazla 50 üye; bildirim izleyicileri kişi sayısına eklenmez
 
 ## Önemli: iki parça birlikte çalışır
 
 GitHub Actions yalnızca Android APK'sini üretir. Sohbetin çalışması için `server/` klasöründeki relay uygulamasının internette açık ve TLS kullanan bir sunucuda çalışması gerekir. Uygulamaya bu adres `wss://alan-adiniz.com/chat` biçiminde girilir.
+
+Bu sürümde `server/server.js` de değişti. ZIP'i GitHub'a yükledikten sonra APK'yı almak tek başına yeterli değildir; Render servisinde son commit'i yeniden dağıtın. Eski relay çalışırsa büyük medya/yoğun mesaj kopma düzeltmeleri, hayalet oturum temizliği ve kayıtlı oda bildirimleri devreye girmez.
 
 ## 1. Sunucuyu çalıştırın
 
@@ -67,8 +72,8 @@ Kullanılabilen ortam değişkenleri:
 | Değişken | Varsayılan | Açıklama |
 | --- | ---: | --- |
 | `PORT` | `8080` | Relay'in dinlediği port |
-| `MAX_ROOM_SIZE` | `10` | Aynı odadaki en fazla bağlantı (2–50) |
-| `MAX_CONNECTIONS` | `50` | Sunucudaki toplam bağlantı sınırı |
+| `MAX_ROOM_SIZE` | `50` | Aynı odadaki en fazla üye (2–100) |
+| `MAX_CONNECTIONS` | `500` | Sunucudaki toplam üye ve bildirim bağlantısı sınırı (3–2000) |
 
 Sunucunun kendisi hiçbir `console` çıktısı, dosya, veritabanı veya mesaj kuyruğu oluşturmaz.
 
@@ -76,12 +81,16 @@ Sunucunun kendisi hiçbir `console` çıktısı, dosya, veritabanı veya mesaj k
 
 - Android 13 ve üzerinde uygulama ilk bağlantıda bildirim izni ister.
 - Mesaj bildirimi göndereni, oda adını veya mesaj içeriğini göstermez; yalnız “Yeni bir bildirim var” yazar.
-- Bağlantının arka planda açık kalması için Android ayrıca düşük öncelikli “Odaya bağlı” hizmet bildirimi gösterir.
-- Görseller en fazla 8 MB, videolar en fazla 20 MB olabilir.
+- Bir odaya bu sürümle en az bir kez girildikten sonra uygulama, parola kaydetmeden o odanın genel etkinlik bildirimini izleyebilir.
+- Bildirim izleyicisi mesajın şifreli paketini dahi almaz ve odadaki kişi sayısına eklenmez.
+- Android düşük öncelikli bir foreground-service bildirimi gösterir. Uygulamayı son uygulamalardan kapatmak servisi durdurmaz; cihaz yeniden başlatılırsa, uygulama zorla durdurulursa veya üreticinin pil yönetimi servisi engellerse uygulamayı yeniden açmak gerekir.
+- Arka plan bildirimi çevrimdışı mesaj teslimi değildir. Relay geçmiş tutmadığından, bağlantının gerçekten kesik olduğu sırada gönderilen içerik sonradan indirilemez.
+- Görseller en fazla 100 MB, videolar en fazla 500 MB olabilir. Büyük aktarım sırasında metin mesajları küçük bir WebSocket kuyruğuyla öncelikli ilerler.
+- Bir alıcının ağı yavaşlarsa relay göndereni odadan atmak yerine akışı geçici olarak yavaşlatır; birikmiş veriyi sınırsız biçimde belleğe doldurmaz.
 - Medya sunucuda veya harici depolamada tutulmaz. Yalnız o anda bağlı ve medya desteği bulunan cihazlara şifreli parçalar hâlinde iletilir.
 - Çevrimdışı kullanıcıya mesaj veya medya sonradan teslim edilmez.
 - Alınan medya, oda süresi dolana kadar uygulamanın özel alanında cihaz anahtarıyla şifreli saklanır. Görüntülemek için açılan geçici kopyalar odadan çıkınca veya sonraki servis başlangıcında temizlenir.
-- Uygulama, relay'in medya protokolünü katılım sırasında doğrular. Render eski sürümdeyse medya düğmesi devre dışı kalır; böylece yarım paket yüzünden oda bağlantısı kopmaz.
+- Uygulama, relay'in medya ve bildirim protokolünü katılım sırasında doğrular. Render eski sürümdeyse ilgili özellik için yeniden dağıtım uyarısı verir.
 
 ## Süreli oda geçmişi
 
@@ -119,6 +128,8 @@ Görünen ad farklı olabilir. Yanlış parola giren kişi aynı oda kodunu kull
 
 - Mesaj metni ve görünen ad açık biçimde yalnız RAM'de işlenir; kalıcı yerel kopya cihaz anahtarıyla şifrelenir.
 - Sunucuya şifreli paket, oda özeti ve parola kanıtı gider. Düz metin parola gitmez.
+- Kayıtlı odanın arka plan etkinliğini doğrulamak için oda özeti ve parola kanıtı cihaz anahtarıyla şifreli yerel kayıtta tutulur; ortak parolanın kendisi ve mesaj çözme anahtarı kalıcı olarak tutulmaz.
+- Cihaza özel rastgele istemci kimliği eski aynı-cihaz bağlantısını değiştirmek ve kendi gönderimine bildirim üretmemek için kullanılır.
 - Relay paketi mevcut oda üyelerine iletir ve hemen bırakır.
 - Çevrimdışı teslim, sunucu geçmişi ve kullanıcı hesabı yoktur. Bir telefon çevrimdışıyken gönderilen içerik o telefona sonradan gelmez.
 - Android uygulaması oda profillerini ve süre dolana kadarki sohbeti uygulamaya özel, yedekleme dışı alanda AES-256-GCM ile şifreli tutar. Şifreleme anahtarı Android Keystore içinde oluşturulur.
@@ -134,10 +145,10 @@ Tam anlamıyla “dünyanın hiçbir katmanında log yok” garantisi uygulama k
 - **Actions iş akışı görünmüyor:** `.github/workflows/android-apk.yml` dosyasının depoda bulunduğunu kontrol edin.
 - **Bağlantı kurulmuyor:** Adresin `wss://` ile başladığını, `/chat` yolunu ve TLS sertifikasını kontrol edin.
 - **Herkes yalnız “1 kişi bağlı” görüyor:** Oda kodu veya ortak parola telefonlarda birebir aynı değildir.
-- **Oda dolu:** Eski bağlantının kapanması en fazla yaklaşık 25 saniye sürebilir.
+- **Kişi sayısı bir fazla:** Tüm telefonlarda yeni APK'nın, Render'da da son sunucu sürümünün çalıştığını kontrol edin. Aynı cihazın eski bağlantısı artık yeni oturum geldiği anda değiştirilir.
 - **Bildirim gelmiyor:** Android uygulama ayarlarından Sessiz Oda bildirim iznini ve pil kullanımında arka plan çalışmasını kontrol edin.
 - **Medya gitmiyor:** İki cihazın da güncel APK'yı kullandığını, o anda odaya bağlı olduğunu ve dosyanın boyut sınırını aşmadığını kontrol edin.
-- **“Sunucu eski sürümde” uyarısı:** Render'da **Manual Deploy → Deploy latest commit** çalıştırın. Ardından `/health` yanıtında `"protocol":2` ve `"media":true` bulunduğunu kontrol edin.
+- **“Sunucu eski sürümde” uyarısı:** Render'da **Manual Deploy → Deploy latest commit** çalıştırın. Ardından `/health` yanıtında `"protocol":3`, `"media":true` ve `"notifications":true` bulunduğunu kontrol edin.
 - **APK güncellenmiyor:** Eski debug APK'yı kaldırıp yenisini kurun.
 
 ## Proje yapısı

@@ -72,7 +72,7 @@ final class LocalStore {
     synchronized List<SavedRoom> getSavedRooms()
             throws IOException, GeneralSecurityException {
         ensureLoaded();
-        boolean changed = false;
+        boolean changed = state.dirty;
         long now = System.currentTimeMillis();
         for (RoomRecord room : state.rooms.values()) {
             changed |= pruneExpired(room, now);
@@ -90,32 +90,74 @@ final class LocalStore {
                     room.retentionMs,
                     room.lastJoinedAt,
                     RetentionPolicy.expiresAt(room.historyStartedAt, room.retentionMs),
-                    room.events.size()
+                    room.events.size(),
+                    room.hasNotificationAccess()
             ));
         }
         rooms.sort((first, second) -> Long.compare(second.lastJoinedAt, first.lastJoinedAt));
         return rooms;
     }
 
+    synchronized NotificationSnapshot getNotificationSnapshot()
+            throws IOException, GeneralSecurityException {
+        ensureLoaded();
+        boolean changed = state.dirty;
+        long now = System.currentTimeMillis();
+        List<NotificationRoom> rooms = new ArrayList<>();
+        for (RoomRecord room : state.rooms.values()) {
+            changed |= pruneExpired(room, now);
+            if (room.hasNotificationAccess()) {
+                rooms.add(new NotificationRoom(
+                        room.server,
+                        room.roomId,
+                        room.authProof,
+                        room.lastJoinedAt
+                ));
+            }
+        }
+        if (changed) {
+            saveState();
+        }
+        rooms.sort((first, second) -> Long.compare(second.lastJoinedAt, first.lastJoinedAt));
+        return new NotificationSnapshot(state.clientId, rooms);
+    }
+
     synchronized RoomHistory prepareRoom(
             String server,
             String roomName,
             String displayName,
+            String roomId,
+            String authProof,
             long requestedRetention,
             File sessionDirectory
     ) throws IOException, GeneralSecurityException {
         ensureLoaded();
+        if (!validHex(roomId, 64) || !validHex(authProof, 64)) {
+            throw new GeneralSecurityException("Bildirim kimliği geçersiz.");
+        }
         long now = System.currentTimeMillis();
         long retentionMs = RetentionPolicy.normalize(requestedRetention);
         String key = roomKey(server, roomName);
         RoomRecord room = state.rooms.get(key);
         if (room == null) {
-            room = new RoomRecord(key, server, roomName, displayName, retentionMs, now, now);
+            room = new RoomRecord(
+                    key,
+                    server,
+                    roomName,
+                    displayName,
+                    roomId,
+                    authProof,
+                    retentionMs,
+                    now,
+                    now
+            );
             state.rooms.put(key, room);
         } else {
             room.server = server;
             room.room = roomName;
             room.displayName = displayName;
+            room.roomId = roomId;
+            room.authProof = authProof;
             room.retentionMs = retentionMs;
             room.lastJoinedAt = now;
             pruneExpired(room, now);
@@ -133,7 +175,8 @@ final class LocalStore {
         return new RoomHistory(
                 key,
                 RetentionPolicy.expiresAt(room.historyStartedAt, room.retentionMs),
-                events
+                events,
+                state.clientId
         );
     }
 
@@ -306,6 +349,7 @@ final class LocalStore {
             Arrays.fill(encrypted, (byte) 0);
         }
         moveReplacing(temporary, stateFile);
+        state.dirty = false;
     }
 
     private void ensureDirectories() throws IOException {
@@ -635,6 +679,7 @@ final class LocalStore {
         final long lastJoinedAt;
         final long expiresAt;
         final int eventCount;
+        final boolean notificationsReady;
 
         SavedRoom(
                 String key,
@@ -644,7 +689,8 @@ final class LocalStore {
                 long retentionMs,
                 long lastJoinedAt,
                 long expiresAt,
-                int eventCount
+                int eventCount,
+                boolean notificationsReady
         ) {
             this.key = key;
             this.server = server;
@@ -654,6 +700,31 @@ final class LocalStore {
             this.lastJoinedAt = lastJoinedAt;
             this.expiresAt = expiresAt;
             this.eventCount = eventCount;
+            this.notificationsReady = notificationsReady;
+        }
+    }
+
+    static final class NotificationRoom {
+        final String server;
+        final String roomId;
+        final String authProof;
+        final long lastJoinedAt;
+
+        NotificationRoom(String server, String roomId, String authProof, long lastJoinedAt) {
+            this.server = server;
+            this.roomId = roomId;
+            this.authProof = authProof;
+            this.lastJoinedAt = lastJoinedAt;
+        }
+    }
+
+    static final class NotificationSnapshot {
+        final String clientId;
+        final List<NotificationRoom> rooms;
+
+        NotificationSnapshot(String clientId, List<NotificationRoom> rooms) {
+            this.clientId = clientId;
+            this.rooms = rooms;
         }
     }
 
@@ -661,20 +732,25 @@ final class LocalStore {
         final String roomKey;
         final long expiresAt;
         final List<ChatEvent> events;
+        final String clientId;
 
-        RoomHistory(String roomKey, long expiresAt, List<ChatEvent> events) {
+        RoomHistory(String roomKey, long expiresAt, List<ChatEvent> events, String clientId) {
             this.roomKey = roomKey;
             this.expiresAt = expiresAt;
             this.events = events;
+            this.clientId = clientId;
         }
     }
 
     private static final class State {
         final Map<String, RoomRecord> rooms = new LinkedHashMap<>();
+        String clientId = UUID.randomUUID().toString().replace("-", "");
+        boolean dirty = true;
 
         JSONObject toJson() throws JSONException {
             JSONObject root = new JSONObject();
             root.put("v", 1);
+            root.put("client", clientId);
             JSONArray roomArray = new JSONArray();
             for (RoomRecord room : rooms.values()) {
                 roomArray.put(room.toJson());
@@ -688,6 +764,11 @@ final class LocalStore {
                 throw new JSONException("Yerel veri sürümü desteklenmiyor.");
             }
             State state = new State();
+            String savedClientId = clean(root.optString("client", ""), 32);
+            if (validHex(savedClientId, 32)) {
+                state.clientId = savedClientId;
+                state.dirty = false;
+            }
             JSONArray roomArray = root.optJSONArray("rooms");
             if (roomArray == null) {
                 return state;
@@ -707,6 +788,8 @@ final class LocalStore {
         String server;
         String room;
         String displayName;
+        String roomId;
+        String authProof;
         long retentionMs;
         long lastJoinedAt;
         long historyStartedAt;
@@ -717,6 +800,8 @@ final class LocalStore {
                 String server,
                 String room,
                 String displayName,
+                String roomId,
+                String authProof,
                 long retentionMs,
                 long lastJoinedAt,
                 long historyStartedAt
@@ -725,6 +810,8 @@ final class LocalStore {
             this.server = server;
             this.room = room;
             this.displayName = displayName;
+            this.roomId = roomId;
+            this.authProof = authProof;
             this.retentionMs = retentionMs;
             this.lastJoinedAt = lastJoinedAt;
             this.historyStartedAt = historyStartedAt;
@@ -736,6 +823,10 @@ final class LocalStore {
             object.put("server", server);
             object.put("room", room);
             object.put("name", displayName);
+            if (hasNotificationAccess()) {
+                object.put("roomId", roomId);
+                object.put("proof", authProof);
+            }
             object.put("retention", retentionMs);
             object.put("joined", lastJoinedAt);
             object.put("started", historyStartedAt);
@@ -755,6 +846,12 @@ final class LocalStore {
             String server = clean(object.optString("server", ""), 300);
             String roomName = clean(object.optString("room", ""), 64);
             String name = clean(object.optString("name", ""), 24);
+            String roomId = clean(object.optString("roomId", ""), 64);
+            String authProof = clean(object.optString("proof", ""), 64);
+            if (!validHex(roomId, 64) || !validHex(authProof, 64)) {
+                roomId = null;
+                authProof = null;
+            }
             long retention = object.optLong("retention", 0);
             long joined = object.optLong("joined", 0);
             long started = object.optLong("started", 0);
@@ -774,6 +871,8 @@ final class LocalStore {
                     server,
                     roomName,
                     name,
+                    roomId,
+                    authProof,
                     retention,
                     joined,
                     started
@@ -789,6 +888,10 @@ final class LocalStore {
                 }
             }
             return room;
+        }
+
+        boolean hasNotificationAccess() {
+            return validHex(roomId, 64) && validHex(authProof, 64);
         }
     }
 
@@ -902,12 +1005,15 @@ final class LocalStore {
             String name = clean(object.optString("name", ""), 120);
             String mediaId = clean(object.optString("media", ""), 32);
             long size = object.optLong("size", 0);
+            long mediaLimit = mime.startsWith("image/")
+                    ? CryptoBox.MAX_IMAGE_BYTES
+                    : CryptoBox.MAX_VIDEO_BYTES;
             if (
                     (!mime.startsWith("image/") && !mime.startsWith("video/")) ||
                     name.isEmpty() ||
                     !mediaId.matches("^[a-f0-9]{32}$") ||
                     size <= 0 ||
-                    size > CryptoBox.MAX_VIDEO_BYTES
+                    size > mediaLimit
             ) {
                 return null;
             }
@@ -921,6 +1027,10 @@ final class LocalStore {
         }
         String cleaned = value.replaceAll("[\\p{Cntrl}]", " ").trim();
         return cleaned.length() <= maxLength ? cleaned : cleaned.substring(0, maxLength);
+    }
+
+    private static boolean validHex(String value, int length) {
+        return value != null && value.matches("^[a-f0-9]{" + length + "}$");
     }
 
     private static String bounded(String value, int maxLength) {

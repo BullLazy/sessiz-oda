@@ -39,6 +39,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ChatService extends Service {
     static final String ACTION_CONNECT = "com.sessizoda.app.CONNECT";
+    static final String ACTION_MONITOR = "com.sessizoda.app.MONITOR";
     static final String EXTRA_SERVER = "server";
     static final String EXTRA_ROOM = "room";
     static final String EXTRA_SECRET = "secret";
@@ -50,8 +51,10 @@ public final class ChatService extends Service {
     private static final int CONNECTION_NOTIFICATION_ID = 1001;
     private static final int MESSAGE_NOTIFICATION_ID = 2_000;
     private static final int MAX_EVENTS = 150;
-    private static final long MAX_QUEUE_BYTES = 512L * 1024L;
-    private static final long INCOMING_TIMEOUT_MS = 3L * 60L * 1_000L;
+    private static final long MAX_QUEUE_BYTES = 16L * 1024L;
+    private static final long INCOMING_TIMEOUT_MS = 6L * 60L * 60L * 1_000L;
+    private static final long MONITOR_RETRY_MIN_MS = 5_000L;
+    private static final long MONITOR_RETRY_MAX_MS = 5L * 60L * 1_000L;
 
     interface Listener {
         void onSessionState(
@@ -88,7 +91,9 @@ public final class ChatService extends Service {
     private final AtomicBoolean mediaSending = new AtomicBoolean(false);
     private final List<ChatEvent> events = new ArrayList<>();
     private final Map<String, IncomingMedia> incomingMedia = new HashMap<>();
+    private final Map<String, RoomMonitorClient> monitorClients = new HashMap<>();
     private final Runnable historyExpiryRunnable = this::handleHistoryExpiry;
+    private final Runnable monitorRetryRunnable = this::reloadNotificationMonitors;
 
     private Listener listener;
     private LocalStore localStore;
@@ -98,7 +103,14 @@ public final class ChatService extends Service {
     private volatile String displayName = "";
     private String roomName = "";
     private String roomKey = "";
+    private String activeServer = "";
+    private String activeRoomId = "";
     private boolean appVisible;
+    private boolean monitoringRequested;
+    private boolean monitorLoadRunning;
+    private boolean foregroundActive;
+    private boolean destroyed;
+    private boolean monitorRetryScheduled;
     private volatile boolean connecting;
     private volatile boolean connected;
     private volatile boolean mediaSupported;
@@ -110,6 +122,8 @@ public final class ChatService extends Service {
     private long nextEventId = 1;
     private long lastDecryptWarningAt;
     private long lastStoreWarningAt;
+    private long monitorGeneration;
+    private long monitorRetryDelayMs = MONITOR_RETRY_MIN_MS;
 
     @Override
     public void onCreate() {
@@ -126,10 +140,22 @@ public final class ChatService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || !ACTION_CONNECT.equals(intent.getAction())) {
+        String action = intent == null ? ACTION_MONITOR : intent.getAction();
+        if (ACTION_MONITOR.equals(action)) {
+            monitoringRequested = canPostNotifications();
+            if (monitoringRequested) {
+                showForegroundNotification(getString(R.string.notification_monitoring));
+                reloadNotificationMonitors();
+                return START_STICKY;
+            }
+            updatePersistentNotification();
+            return START_NOT_STICKY;
+        }
+        if (!ACTION_CONNECT.equals(action)) {
             return START_NOT_STICKY;
         }
 
+        monitoringRequested = canPostNotifications();
         showForegroundNotification(getString(R.string.status_connecting));
         String server = intent.getStringExtra(EXTRA_SERVER);
         String room = intent.getStringExtra(EXTRA_ROOM);
@@ -148,10 +174,10 @@ public final class ChatService extends Service {
                 !RetentionPolicy.isSupported(requestedRetention)
         ) {
             failBeforeJoin("Bağlantı bilgileri eksik.");
-            return START_NOT_STICKY;
+            return START_STICKY;
         }
         beginSession(server, room, secret, name, requestedRetention);
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
     void setListener(Listener newListener, long afterEventId) {
@@ -206,7 +232,7 @@ public final class ChatService extends Service {
     }
 
     void sendMedia(Uri uri) {
-        if (!connected || !mediaSupported || mediaSending.get()) {
+        if (!connected || !mediaSupported || !mediaSending.compareAndSet(false, true)) {
             if (!connected) {
                 emitError("Bağlantı açık değil.");
             } else if (!mediaSupported) {
@@ -221,6 +247,7 @@ public final class ChatService extends Service {
         try {
             metadata = readMetadata(uri);
         } catch (IOException exception) {
+            mediaSending.set(false);
             emitError("Seçilen dosya okunamadı.");
             return;
         }
@@ -228,13 +255,13 @@ public final class ChatService extends Service {
                 ? CryptoBox.MAX_IMAGE_BYTES
                 : CryptoBox.MAX_VIDEO_BYTES;
         if (metadata.size <= 0 || metadata.size > limit) {
+            mediaSending.set(false);
             emitError(metadata.mimeType.startsWith("image/")
-                    ? "Görsel en fazla 8 MB olabilir."
-                    : "Video en fazla 20 MB olabilir.");
+                    ? "Görsel en fazla 100 MB olabilir."
+                    : "Video en fazla 500 MB olabilir.");
             return;
         }
 
-        mediaSending.set(true);
         emitTransfer("Medya hazırlanıyor…", true);
         int generation = connectionGeneration;
         mediaExecutor.execute(() -> transferMedia(uri, metadata, generation));
@@ -261,14 +288,15 @@ public final class ChatService extends Service {
         displayName = "";
         roomName = "";
         roomKey = "";
+        activeServer = "";
+        activeRoomId = "";
         retentionMs = RetentionPolicy.DEFAULT_MS;
         historyExpiresAt = 0;
         mediaSending.set(false);
         clearIncomingMedia();
         storageExecutor.execute(() -> clearDirectory(oldSessionDirectory));
-        stopForeground(STOP_FOREGROUND_REMOVE);
         emitState();
-        stopSelf();
+        reloadNotificationMonitors();
     }
 
     private void beginSession(
@@ -304,6 +332,8 @@ public final class ChatService extends Service {
             cryptoBox = newCrypto;
             displayName = name;
             roomName = room;
+            activeServer = server;
+            activeRoomId = roomId;
             retentionMs = sessionRetention;
             historyExpiresAt = 0;
             connecting = true;
@@ -318,6 +348,8 @@ public final class ChatService extends Service {
                             server,
                             room,
                             name,
+                            roomId,
+                            proof,
                             sessionRetention,
                             newSessionDirectory
                     );
@@ -329,7 +361,8 @@ public final class ChatService extends Service {
                         roomKey = history.roomKey;
                         historyExpiresAt = history.expiresAt;
                         replaceHistory(history.events);
-                        openSocket(generation, server, roomId, proof);
+                        openSocket(generation, server, roomId, proof, history.clientId);
+                        reloadNotificationMonitors();
                     });
                 } catch (IOException | GeneralSecurityException exception) {
                     mainHandler.post(() -> {
@@ -348,12 +381,13 @@ public final class ChatService extends Service {
             int generation,
             String server,
             String roomId,
-            String proof
+            String proof,
+            String clientId
     ) {
         try {
-            chatClient = new ChatClient(server, roomId, proof, new ChatClient.Listener() {
+            chatClient = new ChatClient(server, roomId, proof, clientId, new ChatClient.Listener() {
                 @Override
-                public void onJoined(boolean supportsMedia) {
+                public void onJoined(boolean supportsMedia, boolean supportsNotifications) {
                     mainHandler.post(() -> {
                         if (generation != connectionGeneration) {
                             return;
@@ -361,13 +395,20 @@ public final class ChatService extends Service {
                         connecting = false;
                         connected = true;
                         mediaSupported = supportsMedia;
-                        updateForegroundNotification();
+                        updatePersistentNotification();
+                        reloadNotificationMonitors();
                         scheduleHistoryExpiry();
                         emitState();
                         if (!supportsMedia) {
                             addSystemEvent(
                                     "Sunucu eski sürümde. Görsel/video için Render servisini " +
                                     "son GitHub commit'iyle yeniden dağıtın."
+                            );
+                        }
+                        if (!supportsNotifications) {
+                            addSystemEvent(
+                                    "Sunucu arka plan bildirimlerini desteklemiyor. Render " +
+                                    "servisini son GitHub commit'iyle yeniden dağıtın."
                             );
                         }
                     });
@@ -587,7 +628,7 @@ public final class ChatService extends Service {
             if (input == null) {
                 throw new IOException("Dosya açılamadı.");
             }
-            if (!currentClient.sendCipher("media", currentCrypto.encryptMediaStart(
+            if (!currentClient.sendMediaCipher("start", currentCrypto.encryptMediaStart(
                     transferId,
                     displayName,
                     metadata.mimeType,
@@ -613,7 +654,7 @@ public final class ChatService extends Service {
                         buffer,
                         read
                 );
-                if (!currentClient.sendCipher("media", encryptedChunk)) {
+                if (!currentClient.sendMediaCipher("chunk", encryptedChunk)) {
                     throw new IOException("Medya parçası gönderilemedi.");
                 }
                 sentBytes += read;
@@ -627,8 +668,8 @@ public final class ChatService extends Service {
             if (sentBytes != metadata.size || chunkIndex == 0) {
                 throw new IOException("Dosya boyutu değişti.");
             }
-            if (!waitForQueue(currentClient, generation) || !currentClient.sendCipher(
-                    "media",
+            if (!waitForQueue(currentClient, generation) || !currentClient.sendMediaCipher(
+                    "end",
                     currentCrypto.encryptMediaEnd(
                             transferId,
                             chunkIndex,
@@ -652,18 +693,16 @@ public final class ChatService extends Service {
     }
 
     private boolean waitForQueue(ChatClient client, int generation) {
-        long deadline = System.currentTimeMillis() + 15_000;
         while (client.queueSize() > MAX_QUEUE_BYTES) {
             if (
                     generation != connectionGeneration ||
                     !connected ||
-                    Thread.currentThread().isInterrupted() ||
-                    System.currentTimeMillis() > deadline
+                    Thread.currentThread().isInterrupted()
             ) {
                 return false;
             }
             try {
-                Thread.sleep(20);
+                Thread.sleep(10);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
                 return false;
@@ -875,14 +914,15 @@ public final class ChatService extends Service {
         presence = 0;
         chatClient = null;
         cryptoBox = null;
+        activeServer = "";
+        activeRoomId = "";
         mediaSending.set(false);
         clearIncomingMedia();
-        stopForeground(STOP_FOREGROUND_REMOVE);
         emitState();
         if (hadSession && listener != null) {
             listener.onDisconnected();
         }
-        stopSelf();
+        reloadNotificationMonitors();
     }
 
     private void failBeforeJoin(String message) {
@@ -900,12 +940,13 @@ public final class ChatService extends Service {
         connected = false;
         mediaSupported = false;
         cryptoBox = null;
+        activeServer = "";
+        activeRoomId = "";
         historyExpiresAt = 0;
         storageExecutor.execute(() -> clearDirectory(failedSessionDirectory));
-        stopForeground(STOP_FOREGROUND_REMOVE);
         emitError(message);
         emitState();
-        stopSelf();
+        reloadNotificationMonitors();
     }
 
     private void emitState() {
@@ -975,6 +1016,151 @@ public final class ChatService extends Service {
         incomingMedia.clear();
     }
 
+    private void reloadNotificationMonitors() {
+        mainHandler.removeCallbacks(monitorRetryRunnable);
+        monitorRetryScheduled = false;
+        if (destroyed) {
+            return;
+        }
+        if (!monitoringRequested || !canPostNotifications()) {
+            monitorGeneration++;
+            monitorLoadRunning = false;
+            closeMonitorClients();
+            updatePersistentNotification();
+            return;
+        }
+
+        long requestGeneration = ++monitorGeneration;
+        monitorLoadRunning = true;
+        updatePersistentNotification();
+        storageExecutor.execute(() -> {
+            try {
+                LocalStore.NotificationSnapshot snapshot = localStore.getNotificationSnapshot();
+                mainHandler.post(() -> applyNotificationSnapshot(requestGeneration, snapshot));
+            } catch (IOException | GeneralSecurityException exception) {
+                mainHandler.post(() -> {
+                    if (destroyed || requestGeneration != monitorGeneration) {
+                        return;
+                    }
+                    monitorLoadRunning = false;
+                    scheduleMonitorRefresh();
+                    updatePersistentNotification();
+                });
+            }
+        });
+    }
+
+    private void applyNotificationSnapshot(
+            long requestGeneration,
+            LocalStore.NotificationSnapshot snapshot
+    ) {
+        if (destroyed || requestGeneration != monitorGeneration) {
+            return;
+        }
+        monitorLoadRunning = false;
+        closeMonitorClients();
+
+        Map<String, List<LocalStore.NotificationRoom>> roomsByServer = new HashMap<>();
+        for (LocalStore.NotificationRoom room : snapshot.rooms) {
+            if (
+                    (connecting || connected) &&
+                    room.server.equals(activeServer) &&
+                    room.roomId.equals(activeRoomId)
+            ) {
+                continue;
+            }
+            roomsByServer.computeIfAbsent(room.server, ignored -> new ArrayList<>()).add(room);
+        }
+
+        if (snapshot.rooms.isEmpty()) {
+            monitoringRequested = false;
+        }
+        monitorRetryDelayMs = MONITOR_RETRY_MIN_MS;
+        for (Map.Entry<String, List<LocalStore.NotificationRoom>> entry : roomsByServer.entrySet()) {
+            String server = entry.getKey();
+            List<LocalStore.NotificationRoom> rooms = entry.getValue();
+            RoomMonitorClient[] holder = new RoomMonitorClient[1];
+            RoomMonitorClient monitor = new RoomMonitorClient(
+                    server,
+                    snapshot.clientId,
+                    rooms,
+                    new RoomMonitorClient.Listener() {
+                        @Override
+                        public void onReady() {
+                            mainHandler.post(() -> {
+                                if (
+                                        !destroyed &&
+                                        requestGeneration == monitorGeneration &&
+                                        monitorClients.get(server) == holder[0]
+                                ) {
+                                    monitorRetryDelayMs = MONITOR_RETRY_MIN_MS;
+                                    updatePersistentNotification();
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onActivity(String roomId) {
+                            mainHandler.post(() -> {
+                                if (
+                                        !destroyed &&
+                                        requestGeneration == monitorGeneration &&
+                                        monitorClients.get(server) == holder[0] &&
+                                        !appVisible
+                                ) {
+                                    showMessageNotification();
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onDisconnected() {
+                            mainHandler.post(() -> {
+                                if (
+                                        destroyed ||
+                                        requestGeneration != monitorGeneration ||
+                                        monitorClients.get(server) != holder[0]
+                                ) {
+                                    return;
+                                }
+                                monitorClients.remove(server);
+                                scheduleMonitorRefresh();
+                                updatePersistentNotification();
+                            });
+                        }
+                    }
+            );
+            holder[0] = monitor;
+            monitorClients.put(server, monitor);
+            monitor.connect();
+        }
+        updatePersistentNotification();
+    }
+
+    private void scheduleMonitorRefresh() {
+        if (destroyed || !monitoringRequested || !canPostNotifications()) {
+            return;
+        }
+        mainHandler.removeCallbacks(monitorRetryRunnable);
+        monitorRetryScheduled = true;
+        mainHandler.postDelayed(monitorRetryRunnable, monitorRetryDelayMs);
+        monitorRetryDelayMs = Math.min(MONITOR_RETRY_MAX_MS, monitorRetryDelayMs * 2L);
+    }
+
+    private void closeMonitorClients() {
+        List<RoomMonitorClient> clients = new ArrayList<>(monitorClients.values());
+        monitorClients.clear();
+        for (RoomMonitorClient client : clients) {
+            client.close();
+        }
+    }
+
+    private boolean canPostNotifications() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                        PackageManager.PERMISSION_GRANTED;
+    }
+
     private void createNotificationChannels() {
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager == null) {
@@ -1009,28 +1195,51 @@ public final class ChatService extends Service {
         } else {
             startForeground(CONNECTION_NOTIFICATION_ID, notification);
         }
+        foregroundActive = true;
     }
 
-    private void updateForegroundNotification() {
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) {
-            manager.notify(
-                    CONNECTION_NOTIFICATION_ID,
-                    buildNotification(
-                            CONNECTION_CHANNEL,
-                            getString(R.string.app_name),
-                            getString(R.string.notification_connected),
-                            true
-                    )
-            );
+    private void updatePersistentNotification() {
+        String status = null;
+        if (connecting) {
+            status = getString(R.string.status_connecting);
+        } else if (connected) {
+            status = getString(R.string.notification_connected);
+        } else if (
+                monitorLoadRunning ||
+                monitorRetryScheduled ||
+                !monitorClients.isEmpty()
+        ) {
+            status = getString(R.string.notification_monitoring);
         }
+
+        if (status != null) {
+            if (!foregroundActive) {
+                showForegroundNotification(status);
+                return;
+            }
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.notify(
+                        CONNECTION_NOTIFICATION_ID,
+                        buildNotification(
+                                CONNECTION_CHANNEL,
+                                getString(R.string.app_name),
+                                status,
+                                true
+                        )
+                );
+            }
+            return;
+        }
+        if (foregroundActive) {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            foregroundActive = false;
+        }
+        stopSelf();
     }
 
     private void showMessageNotification() {
-        if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!canPostNotifications()) {
             return;
         }
         NotificationManager manager = getSystemService(NotificationManager.class);
@@ -1038,10 +1247,10 @@ public final class ChatService extends Service {
             manager.notify(
                     MESSAGE_NOTIFICATION_ID,
                     buildNotification(
-                            MESSAGE_CHANNEL,
-                            getString(R.string.notification_new),
-                            null,
-                            false
+                        MESSAGE_CHANNEL,
+                        getString(R.string.notification_new),
+                        null,
+                        false
                     )
             );
         }
@@ -1126,8 +1335,13 @@ public final class ChatService extends Service {
 
     @Override
     public void onDestroy() {
+        destroyed = true;
         connectionGeneration++;
+        monitorGeneration++;
         mainHandler.removeCallbacks(historyExpiryRunnable);
+        mainHandler.removeCallbacks(monitorRetryRunnable);
+        monitorRetryScheduled = false;
+        closeMonitorClients();
         ChatClient oldClient = chatClient;
         chatClient = null;
         if (oldClient != null) {

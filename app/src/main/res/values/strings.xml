@@ -50,9 +50,10 @@
     <string name="media_image_description">Gönderilen görsel; büyütmek için dokunun</string>
     <string name="media_video_description">Gönderilen video; oynatmak için dokunun</string>
     <string name="notification_channel_connection">Sohbet bağlantısı</string>
-    <string name="notification_channel_connection_description">Arka planda oda bağlantısını açık tutar</string>
+    <string name="notification_channel_connection_description">Etkin oda ve kayıtlı oda bildirim bağlantılarını arka planda açık tutar</string>
     <string name="notification_channel_messages">Yeni mesajlar</string>
     <string name="notification_channel_messages_description">Mesaj içeriğini göstermeyen yeni ileti bildirimleri</string>
     <string name="notification_connected">Odaya bağlı</string>
+    <string name="notification_monitoring">Kayıtlı odaların bildirimleri açık</string>
     <string name="notification_new">Yeni bir bildirim var</string>
 </resources>

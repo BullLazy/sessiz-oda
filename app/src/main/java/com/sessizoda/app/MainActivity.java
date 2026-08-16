@@ -84,6 +84,7 @@ public final class MainActivity extends Activity {
     private boolean connecting;
     private boolean mediaSupported;
     private boolean notificationPermissionAsked;
+    private boolean hasNotificationRooms;
     private String displayName = "";
     private int presence;
     private long retentionMs = RetentionPolicy.DEFAULT_MS;
@@ -261,8 +262,10 @@ public final class MainActivity extends Activity {
     protected void onStart() {
         super.onStart();
         activityVisible = true;
+        refreshSavedRooms(false);
         Intent serviceIntent = new Intent(this, ChatService.class);
         bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE);
+        startSavedRoomMonitoring();
     }
 
     @Override
@@ -338,6 +341,7 @@ public final class MainActivity extends Activity {
             boolean sessionMediaSupported,
             long sessionRetentionMs
     ) {
+        boolean newlyConnected = sessionConnected && !connected;
         connecting = sessionConnecting;
         connected = sessionConnected;
         displayName = sessionName == null ? "" : sessionName;
@@ -356,6 +360,10 @@ public final class MainActivity extends Activity {
             retentionSpinner.setSelection(RetentionPolicy.indexOf(retentionMs));
             updatePresenceText();
             messageInput.requestFocus();
+            if (newlyConnected) {
+                refreshSavedRooms(false);
+                startSavedRoomMonitoring();
+            }
         } else if (connecting) {
             loginStatus.setTextColor(Color.parseColor("#3157D5"));
             loginStatus.setText(R.string.status_connecting);
@@ -453,14 +461,19 @@ public final class MainActivity extends Activity {
                     "Bildirim izni verilmedi; mesaj bildirimi gösterilmeyecek.",
                     Toast.LENGTH_LONG
             ).show();
+        } else if (
+                requestCode == REQUEST_NOTIFICATIONS &&
+                grantResults.length > 0 &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+        ) {
+            refreshSavedRooms(false);
+            startSavedRoomMonitoring();
         }
     }
 
     private void returnToLogin() {
         if (serviceBound && chatService != null) {
             chatService.leave();
-        } else {
-            stopService(new Intent(this, ChatService.class));
         }
         connected = false;
         connecting = false;
@@ -480,6 +493,7 @@ public final class MainActivity extends Activity {
         chatPanel.setVisibility(View.GONE);
         loginScroll.setVisibility(View.VISIBLE);
         refreshSavedRooms(true);
+        startSavedRoomMonitoring();
     }
 
     private void replaceVisibleHistory(List<ChatEvent> events) {
@@ -495,8 +509,16 @@ public final class MainActivity extends Activity {
         try {
             rooms = localStore.getSavedRooms();
         } catch (IOException | GeneralSecurityException exception) {
+            hasNotificationRooms = false;
             savedRoomsSection.setVisibility(View.GONE);
             return;
+        }
+        hasNotificationRooms = false;
+        for (LocalStore.SavedRoom room : rooms) {
+            if (room.notificationsReady) {
+                hasNotificationRooms = true;
+                break;
+            }
         }
         savedRoomsContainer.removeAllViews();
         savedRoomsSection.setVisibility(rooms.isEmpty() ? View.GONE : View.VISIBLE);
@@ -553,6 +575,23 @@ public final class MainActivity extends Activity {
         roomInput.setText(room.room);
         retentionSpinner.setSelection(RetentionPolicy.indexOf(room.retentionMs));
         loginStatus.setText("");
+    }
+
+    private void startSavedRoomMonitoring() {
+        if (!hasNotificationRooms) {
+            return;
+        }
+        if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED
+        ) {
+            askNotificationPermission();
+            return;
+        }
+        Intent intent = new Intent(this, ChatService.class)
+                .setAction(ChatService.ACTION_MONITOR);
+        startForegroundService(intent);
     }
 
     private String retentionLabel(long value) {
