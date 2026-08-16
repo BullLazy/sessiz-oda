@@ -11,6 +11,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
@@ -32,18 +33,24 @@ import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.MediaController;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.widget.VideoView;
 
 import java.io.File;
+import java.io.IOException;
+import java.security.GeneralSecurityException;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 
 public final class MainActivity extends Activity {
     private static final int MAX_VISIBLE_MESSAGES = 150;
@@ -57,6 +64,7 @@ public final class MainActivity extends Activity {
     private EditText roomInput;
     private EditText secretInput;
     private EditText messageInput;
+    private Spinner retentionSpinner;
     private Button connectButton;
     private Button sendButton;
     private Button mediaButton;
@@ -65,8 +73,11 @@ public final class MainActivity extends Activity {
     private TextView connectionStatus;
     private LinearLayout messagesContainer;
     private ScrollView messagesScroll;
+    private View savedRoomsSection;
+    private LinearLayout savedRoomsContainer;
 
     private ChatService chatService;
+    private LocalStore localStore;
     private boolean serviceBound;
     private boolean activityVisible;
     private boolean connected;
@@ -75,6 +86,7 @@ public final class MainActivity extends Activity {
     private boolean notificationPermissionAsked;
     private String displayName = "";
     private int presence;
+    private long retentionMs = RetentionPolicy.DEFAULT_MS;
     private long lastRenderedEventId;
     private Uri pendingMediaUri;
 
@@ -86,7 +98,8 @@ public final class MainActivity extends Activity {
                 String sessionRoom,
                 String sessionName,
                 int sessionPresence,
-                boolean sessionMediaSupported
+                boolean sessionMediaSupported,
+                long sessionRetentionMs
         ) {
             runOnUiThread(() -> applySessionState(
                     sessionConnecting,
@@ -94,13 +107,19 @@ public final class MainActivity extends Activity {
                     sessionRoom,
                     sessionName,
                     sessionPresence,
-                    sessionMediaSupported
+                    sessionMediaSupported,
+                    sessionRetentionMs
             ));
         }
 
         @Override
         public void onEvent(ChatEvent event) {
             runOnUiThread(() -> renderEvent(event));
+        }
+
+        @Override
+        public void onHistoryReset(List<ChatEvent> events) {
+            runOnUiThread(() -> replaceVisibleHistory(events));
         }
 
         @Override
@@ -187,6 +206,7 @@ public final class MainActivity extends Activity {
         roomInput = findViewById(R.id.room_input);
         secretInput = findViewById(R.id.secret_input);
         messageInput = findViewById(R.id.message_input);
+        retentionSpinner = findViewById(R.id.retention_spinner);
         connectButton = findViewById(R.id.connect_button);
         sendButton = findViewById(R.id.send_button);
         mediaButton = findViewById(R.id.media_button);
@@ -195,7 +215,19 @@ public final class MainActivity extends Activity {
         connectionStatus = findViewById(R.id.connection_status);
         messagesContainer = findViewById(R.id.messages_container);
         messagesScroll = findViewById(R.id.messages_scroll);
+        savedRoomsSection = findViewById(R.id.saved_rooms_section);
+        savedRoomsContainer = findViewById(R.id.saved_rooms_container);
         Button leaveButton = findViewById(R.id.leave_button);
+
+        localStore = LocalStore.get(this);
+        ArrayAdapter<CharSequence> retentionAdapter = ArrayAdapter.createFromResource(
+                this,
+                R.array.retention_options,
+                android.R.layout.simple_spinner_item
+        );
+        retentionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        retentionSpinner.setAdapter(retentionAdapter);
+        retentionSpinner.setSelection(RetentionPolicy.indexOf(RetentionPolicy.DEFAULT_MS));
 
         nameInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(24)});
         serverInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(300)});
@@ -222,6 +254,7 @@ public final class MainActivity extends Activity {
             return false;
         });
         configureKeyboardLayout();
+        refreshSavedRooms(true);
     }
 
     @Override
@@ -254,6 +287,7 @@ public final class MainActivity extends Activity {
         String rawServer = serverInput.getText().toString().trim();
         String room = roomInput.getText().toString().trim();
         String secret = secretInput.getText().toString();
+        int retentionIndex = retentionSpinner.getSelectedItemPosition();
 
         if (name.length() < 2) {
             showLoginError("Görünen ad en az 2 karakter olmalı.");
@@ -272,6 +306,11 @@ public final class MainActivity extends Activity {
             showLoginError("Ortak parola en az 12 karakter olmalı.");
             return;
         }
+        if (retentionIndex < 0 || retentionIndex >= RetentionPolicy.VALUES.length) {
+            showLoginError("Sohbet silinme süresi geçersiz.");
+            return;
+        }
+        long selectedRetention = RetentionPolicy.VALUES[retentionIndex];
 
         askNotificationPermission();
         connecting = true;
@@ -284,7 +323,8 @@ public final class MainActivity extends Activity {
                 .putExtra(ChatService.EXTRA_SERVER, serverUrl)
                 .putExtra(ChatService.EXTRA_ROOM, room)
                 .putExtra(ChatService.EXTRA_SECRET, secret)
-                .putExtra(ChatService.EXTRA_NAME, name);
+                .putExtra(ChatService.EXTRA_NAME, name)
+                .putExtra(ChatService.EXTRA_RETENTION_MS, selectedRetention);
         startForegroundService(intent);
         secretInput.setText("");
     }
@@ -295,13 +335,15 @@ public final class MainActivity extends Activity {
             String sessionRoom,
             String sessionName,
             int sessionPresence,
-            boolean sessionMediaSupported
+            boolean sessionMediaSupported,
+            long sessionRetentionMs
     ) {
         connecting = sessionConnecting;
         connected = sessionConnected;
         displayName = sessionName == null ? "" : sessionName;
         presence = sessionPresence;
         mediaSupported = sessionMediaSupported;
+        retentionMs = RetentionPolicy.normalize(sessionRetentionMs);
         connectButton.setEnabled(!connecting && !connected);
 
         if (connected) {
@@ -311,6 +353,7 @@ public final class MainActivity extends Activity {
             sendButton.setEnabled(true);
             mediaButton.setEnabled(mediaSupported);
             loginStatus.setText("");
+            retentionSpinner.setSelection(RetentionPolicy.indexOf(retentionMs));
             updatePresenceText();
             messageInput.requestFocus();
         } else if (connecting) {
@@ -436,6 +479,96 @@ public final class MainActivity extends Activity {
         loginStatus.setText("");
         chatPanel.setVisibility(View.GONE);
         loginScroll.setVisibility(View.VISIBLE);
+        refreshSavedRooms(true);
+    }
+
+    private void replaceVisibleHistory(List<ChatEvent> events) {
+        messagesContainer.removeAllViews();
+        lastRenderedEventId = 0;
+        for (ChatEvent event : new ArrayList<>(events)) {
+            renderEvent(event);
+        }
+    }
+
+    private void refreshSavedRooms(boolean prefillLatest) {
+        List<LocalStore.SavedRoom> rooms;
+        try {
+            rooms = localStore.getSavedRooms();
+        } catch (IOException | GeneralSecurityException exception) {
+            savedRoomsSection.setVisibility(View.GONE);
+            return;
+        }
+        savedRoomsContainer.removeAllViews();
+        savedRoomsSection.setVisibility(rooms.isEmpty() ? View.GONE : View.VISIBLE);
+        for (LocalStore.SavedRoom room : rooms) {
+            Button roomButton = new Button(this);
+            roomButton.setAllCaps(false);
+            roomButton.setBackgroundResource(R.drawable.secondary_button);
+            roomButton.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            roomButton.setSingleLine(false);
+            roomButton.setMaxLines(3);
+            roomButton.setMinHeight(dp(58));
+            roomButton.setPadding(dp(14), dp(8), dp(14), dp(8));
+            roomButton.setTextColor(Color.parseColor("#2444AE"));
+            roomButton.setTextSize(14);
+            roomButton.setText(savedRoomLabel(room));
+            roomButton.setOnClickListener(view -> selectSavedRoom(room));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+            );
+            params.bottomMargin = dp(8);
+            roomButton.setLayoutParams(params);
+            savedRoomsContainer.addView(roomButton);
+        }
+        if (prefillLatest && !rooms.isEmpty() && !connected && !connecting) {
+            selectSavedRoom(rooms.get(0));
+        }
+    }
+
+    private String savedRoomLabel(LocalStore.SavedRoom room) {
+        String host = Uri.parse(room.server).getHost();
+        if (host == null || host.isEmpty()) {
+            host = room.server;
+        }
+        String count = room.eventCount == 0
+                ? getString(R.string.saved_room_empty)
+                : getResources().getQuantityString(
+                        R.plurals.saved_room_messages,
+                        room.eventCount,
+                        room.eventCount
+                );
+        return getString(
+                R.string.saved_room_card,
+                room.room,
+                host,
+                retentionLabel(room.retentionMs),
+                count
+        );
+    }
+
+    private void selectSavedRoom(LocalStore.SavedRoom room) {
+        nameInput.setText(room.displayName);
+        serverInput.setText(room.server);
+        roomInput.setText(room.room);
+        retentionSpinner.setSelection(RetentionPolicy.indexOf(room.retentionMs));
+        loginStatus.setText("");
+    }
+
+    private String retentionLabel(long value) {
+        if (value == RetentionPolicy.HOUR_MS) {
+            return getString(R.string.retention_one_hour);
+        }
+        if (value == 6L * RetentionPolicy.HOUR_MS) {
+            return getString(R.string.retention_six_hours);
+        }
+        if (value == 3L * RetentionPolicy.DAY_MS) {
+            return getString(R.string.retention_three_days);
+        }
+        if (value == 7L * RetentionPolicy.DAY_MS) {
+            return getString(R.string.retention_seven_days);
+        }
+        return getString(R.string.retention_one_day);
     }
 
     private void renderEvent(ChatEvent event) {
@@ -576,7 +709,7 @@ public final class MainActivity extends Activity {
         bubble.setBackground(background);
 
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
+                bubbleWidth(),
                 LinearLayout.LayoutParams.WRAP_CONTENT
         );
         params.gravity = ownMessage ? Gravity.END : Gravity.START;
@@ -778,9 +911,10 @@ public final class MainActivity extends Activity {
     private void updatePresenceText() {
         if (connected) {
             connectionStatus.setText(getResources().getQuantityString(
-                    R.plurals.status_people,
+                    R.plurals.status_people_with_retention,
                     presence,
-                    presence
+                    presence,
+                    retentionLabel(retentionMs)
             ));
         }
     }
@@ -790,10 +924,20 @@ public final class MainActivity extends Activity {
     }
 
     private int maxBubbleContentWidth() {
-        return Math.max(
-                dp(120),
-                (int) (getResources().getDisplayMetrics().widthPixels * 0.82f) - dp(28)
-        );
+        return Math.max(dp(132), bubbleWidth() - dp(28));
+    }
+
+    private int bubbleWidth() {
+        int available = getResources().getDisplayMetrics().widthPixels - dp(32);
+        return Math.min(dp(300), Math.max(dp(160), available));
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        View root = findViewById(R.id.root_container);
+        root.requestApplyInsets();
+        scrollToLatestMessage();
     }
 
     private int dp(int value) {

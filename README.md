@@ -1,6 +1,6 @@
 # Sessiz Oda
 
-Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygulamasıdır. Mesaj geçmişi, hesap, veritabanı, analitik veya uygulama içi log yoktur. Sunucu yalnızca o anda bağlı cihazlar arasında şifreli paketleri iletir.
+Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygulamasıdır. Sunucu geçmiş tutmaz; uygulama seçilen süre dolana kadar sohbeti yalnız ilgili telefonda, cihaz anahtarıyla şifreli biçimde saklar. Hesap, analitik, reklam veya uygulama içi log yoktur.
 
 ## Neler var?
 
@@ -9,10 +9,16 @@ Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygul
 - Ortak parola ile cihaz üzerinde AES-256-GCM şifreleme
 - Parolanın sunucuya hiç gönderilmemesi
 - Mesajların sunucuda saklanmaması ve sonradan gelen kişiye eski mesaj verilmemesi
-- Uygulama kapanınca ekrandaki mesajların kaybolması
+- Oda başına 1 saat, 6 saat, 24 saat, 3 gün veya 7 gün süreli şifreli yerel geçmiş
+- Süre dolunca sohbetin ve yerel medya kopyalarının silinmesi; kayıtlı oda kartının kalması
+- Görünen ad, sunucu adresi ve oda kodunun cihazda şifreli biçimde hatırlanması
+- Ortak parolanın hiçbir zaman kalıcı olarak kaydedilmemesi
+- Daha önce girilen odaları tek dokunuşla dolduran kayıtlı oda kartları
 - Mesajlarda cihazın saat biçimine uygun gönderim saati
 - Mesaja uzun basarak metni panoya kopyalama
 - Yazma alanının ekran klavyesinin üzerinde kalması
+- Tek karakterli iletilerde de ad, mesaj ve saati düzgün gösteren sabit genişlikte balon
+- Telefon yatay veya dikey çevrildiğinde açık oturumun korunması
 - Uygulama arka plandayken içeriği göstermeyen “Yeni bir bildirim var” bildirimi
 - Bağlı oda üyeleri arasında uçtan uca şifreli görsel ve video aktarımı
 - Ekran görüntüsü ve son uygulamalar önizlemesinin Android tarafında engellenmesi
@@ -74,8 +80,16 @@ Sunucunun kendisi hiçbir `console` çıktısı, dosya, veritabanı veya mesaj k
 - Görseller en fazla 8 MB, videolar en fazla 20 MB olabilir.
 - Medya sunucuda veya harici depolamada tutulmaz. Yalnız o anda bağlı ve medya desteği bulunan cihazlara şifreli parçalar hâlinde iletilir.
 - Çevrimdışı kullanıcıya mesaj veya medya sonradan teslim edilmez.
-- Alınan medya yalnız uygulamanın geçici önbelleğinde açık hâle getirilir; odadan çıkınca silinir. Uygulama beklenmedik biçimde kapanırsa kalan geçici dosyalar sonraki başlangıçta temizlenir.
+- Alınan medya, oda süresi dolana kadar uygulamanın özel alanında cihaz anahtarıyla şifreli saklanır. Görüntülemek için açılan geçici kopyalar odadan çıkınca veya sonraki servis başlangıcında temizlenir.
 - Uygulama, relay'in medya protokolünü katılım sırasında doğrular. Render eski sürümdeyse medya düğmesi devre dışı kalır; böylece yarım paket yüzünden oda bağlantısı kopmaz.
+
+## Süreli oda geçmişi
+
+- Giriş ekranında oda için 1 saat, 6 saat, 24 saat, 3 gün veya 7 gün seçilir.
+- Süre, o telefondaki sohbet geçmişi için geçerlidir. Relay geçmiş ve oda ayarı saklamadığı için diğer telefonlarda aynı süre ayrıca seçilmelidir.
+- Süre dolduğunda oda açıksa ekran ve şifreli yerel kayıt hemen temizlenir. Uygulama çalışmıyorsa temizlik bir sonraki açılışta, geçmiş gösterilmeden önce yapılır.
+- Oda kartı silinmez; sohbeti boş olarak yeniden kullanabilirsiniz.
+- Her telefonda oda başına en fazla 150 sohbet olayı tutulur.
 
 ## 2. GitHub Actions ile APK alın
 
@@ -103,12 +117,14 @@ Görünen ad farklı olabilir. Yanlış parola giren kişi aynı oda kodunu kull
 
 ## Veri davranışı
 
-- Mesaj metni ve görünen ad, telefonda şifrelenmeden önce yalnız RAM'dedir.
+- Mesaj metni ve görünen ad açık biçimde yalnız RAM'de işlenir; kalıcı yerel kopya cihaz anahtarıyla şifrelenir.
 - Sunucuya şifreli paket, oda özeti ve parola kanıtı gider. Düz metin parola gitmez.
 - Relay paketi mevcut oda üyelerine iletir ve hemen bırakır.
-- Çevrimdışı mesaj, geçmiş ve kullanıcı hesabı yoktur.
-- Android uygulaması `SharedPreferences`, SQLite/Room, kalıcı mesaj veritabanı, analitik, reklam veya crash-reporting SDK'sı kullanmaz.
-- Ekranda en fazla 150 sohbet olayı tutulur. Metinler yalnız RAM'dedir; alınan medya yalnız geçici uygulama önbelleğindedir. Oda terk edilince ikisi de temizlenir.
+- Çevrimdışı teslim, sunucu geçmişi ve kullanıcı hesabı yoktur. Bir telefon çevrimdışıyken gönderilen içerik o telefona sonradan gelmez.
+- Android uygulaması oda profillerini ve süre dolana kadarki sohbeti uygulamaya özel, yedekleme dışı alanda AES-256-GCM ile şifreli tutar. Şifreleme anahtarı Android Keystore içinde oluşturulur.
+- Görünen ad, sunucu adresi ve oda kodu hatırlanır; ortak parola kaydedilmez.
+- Uygulama `SharedPreferences`, SQLite/Room, analitik, reklam veya crash-reporting SDK'sı kullanmaz.
+- Oda başına en fazla 150 sohbet olayı tutulur. Süre dolduğunda metinler ve şifreli medya dosyaları silinir; kayıtlı oda profili kalır.
 - Medya aktarımında relay; içeriği, dosya adını ve MIME türünü okuyamaz fakat medya trafiği olduğunu, şifreli paket boyutlarını ve aktarım zamanını görebilir.
 
 Tam anlamıyla “dünyanın hiçbir katmanında log yok” garantisi uygulama koduyla verilemez. Android işletim sistemi, internet sağlayıcı, ters proxy veya barındırma firması bağlantı zamanı ve IP gibi teknik metaverileri kendi politikasına göre kaydedebilir. Kesin denetim gerekiyorsa relay kendi sunucunuzda çalıştırılmalı ve işletim sistemi/proxy erişim kayıtları ayrıca kapatılmalıdır. Mesaj içeriği yine uçtan uca şifrelidir.

@@ -43,6 +43,7 @@ public final class ChatService extends Service {
     static final String EXTRA_ROOM = "room";
     static final String EXTRA_SECRET = "secret";
     static final String EXTRA_NAME = "name";
+    static final String EXTRA_RETENTION_MS = "retention_ms";
 
     private static final String CONNECTION_CHANNEL = "connection";
     private static final String MESSAGE_CHANNEL = "messages";
@@ -59,10 +60,13 @@ public final class ChatService extends Service {
                 String roomName,
                 String displayName,
                 int presence,
-                boolean mediaSupported
+                boolean mediaSupported,
+                long retentionMs
         );
 
         void onEvent(ChatEvent event);
+
+        void onHistoryReset(List<ChatEvent> events);
 
         void onError(String message);
 
@@ -80,30 +84,39 @@ public final class ChatService extends Service {
     private final IBinder binder = new LocalBinder();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService mediaExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService storageExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean mediaSending = new AtomicBoolean(false);
     private final List<ChatEvent> events = new ArrayList<>();
     private final Map<String, IncomingMedia> incomingMedia = new HashMap<>();
+    private final Runnable historyExpiryRunnable = this::handleHistoryExpiry;
 
     private Listener listener;
+    private LocalStore localStore;
     private volatile ChatClient chatClient;
     private volatile CryptoBox cryptoBox;
     private volatile File sessionDirectory;
     private volatile String displayName = "";
     private String roomName = "";
+    private String roomKey = "";
     private boolean appVisible;
     private volatile boolean connecting;
     private volatile boolean connected;
     private volatile boolean mediaSupported;
     private int presence;
     private volatile int connectionGeneration;
+    private long retentionMs = RetentionPolicy.DEFAULT_MS;
+    private long historyExpiresAt;
+    private long historyCycle;
     private long nextEventId = 1;
     private long lastDecryptWarningAt;
+    private long lastStoreWarningAt;
 
     @Override
     public void onCreate() {
         super.onCreate();
+        localStore = LocalStore.get(this);
         createNotificationChannels();
-        clearDirectory(new File(getCacheDir(), "session-media"));
+        clearSessionDirectories();
     }
 
     @Override
@@ -122,12 +135,22 @@ public final class ChatService extends Service {
         String room = intent.getStringExtra(EXTRA_ROOM);
         String secret = intent.getStringExtra(EXTRA_SECRET);
         String name = intent.getStringExtra(EXTRA_NAME);
+        long requestedRetention = intent.getLongExtra(
+                EXTRA_RETENTION_MS,
+                RetentionPolicy.DEFAULT_MS
+        );
         intent.removeExtra(EXTRA_SECRET);
-        if (server == null || room == null || secret == null || name == null) {
+        if (
+                server == null ||
+                room == null ||
+                secret == null ||
+                name == null ||
+                !RetentionPolicy.isSupported(requestedRetention)
+        ) {
             failBeforeJoin("Bağlantı bilgileri eksik.");
             return START_NOT_STICKY;
         }
-        beginSession(server, room, secret, name);
+        beginSession(server, room, secret, name, requestedRetention);
         return START_NOT_STICKY;
     }
 
@@ -137,9 +160,14 @@ public final class ChatService extends Service {
             return;
         }
         emitState();
-        for (ChatEvent event : new ArrayList<>(events)) {
-            if (event.id > afterEventId) {
-                newListener.onEvent(event);
+        List<ChatEvent> snapshot = new ArrayList<>(events);
+        if (afterEventId <= 0) {
+            newListener.onHistoryReset(snapshot);
+        } else {
+            for (ChatEvent event : snapshot) {
+                if (event.id > afterEventId) {
+                    newListener.onEvent(event);
+                }
             }
         }
     }
@@ -214,11 +242,17 @@ public final class ChatService extends Service {
 
     void leave() {
         connectionGeneration++;
+        historyCycle++;
+        mainHandler.removeCallbacks(historyExpiryRunnable);
         ChatClient oldClient = chatClient;
         chatClient = null;
         if (oldClient != null) {
             oldClient.close();
         }
+        File oldSessionDirectory = sessionDirectory;
+        sessionDirectory = null;
+        events.clear();
+        nextEventId = 1;
         connecting = false;
         connected = false;
         mediaSupported = false;
@@ -226,23 +260,37 @@ public final class ChatService extends Service {
         cryptoBox = null;
         displayName = "";
         roomName = "";
+        roomKey = "";
+        retentionMs = RetentionPolicy.DEFAULT_MS;
+        historyExpiresAt = 0;
         mediaSending.set(false);
         clearIncomingMedia();
-        clearEvents();
-        clearDirectory(sessionDirectory);
+        storageExecutor.execute(() -> clearDirectory(oldSessionDirectory));
         stopForeground(STOP_FOREGROUND_REMOVE);
         emitState();
         stopSelf();
     }
 
-    private void beginSession(String server, String room, String secret, String name) {
+    private void beginSession(
+            String server,
+            String room,
+            String secret,
+            String name,
+            long requestedRetention
+    ) {
         if (connecting || connected || chatClient != null) {
             return;
         }
-        clearEvents();
+        events.clear();
+        nextEventId = 1;
         clearIncomingMedia();
-        sessionDirectory = new File(getCacheDir(), "session-media");
-        clearDirectory(sessionDirectory);
+        int generation = ++connectionGeneration;
+        historyCycle++;
+        File newSessionDirectory = new File(
+                getCacheDir(),
+                "session-media-" + generation + "-" + System.currentTimeMillis()
+        );
+        sessionDirectory = newSessionDirectory;
         if (!sessionDirectory.mkdirs() && !sessionDirectory.isDirectory()) {
             failBeforeJoin("Geçici medya alanı hazırlanamadı.");
             return;
@@ -252,16 +300,57 @@ public final class ChatService extends Service {
             CryptoBox newCrypto = new CryptoBox(room, secret);
             String roomId = CryptoBox.roomId(room);
             String proof = newCrypto.authProof(roomId);
+            long sessionRetention = RetentionPolicy.normalize(requestedRetention);
             cryptoBox = newCrypto;
             displayName = name;
             roomName = room;
+            retentionMs = sessionRetention;
+            historyExpiresAt = 0;
             connecting = true;
             connected = false;
             mediaSupported = false;
             presence = 0;
             emitState();
 
-            int generation = ++connectionGeneration;
+            storageExecutor.execute(() -> {
+                try {
+                    LocalStore.RoomHistory history = localStore.prepareRoom(
+                            server,
+                            room,
+                            name,
+                            sessionRetention,
+                            newSessionDirectory
+                    );
+                    mainHandler.post(() -> {
+                        if (generation != connectionGeneration) {
+                            clearDirectory(newSessionDirectory);
+                            return;
+                        }
+                        roomKey = history.roomKey;
+                        historyExpiresAt = history.expiresAt;
+                        replaceHistory(history.events);
+                        openSocket(generation, server, roomId, proof);
+                    });
+                } catch (IOException | GeneralSecurityException exception) {
+                    mainHandler.post(() -> {
+                        if (generation == connectionGeneration) {
+                            failBeforeJoin("Şifreli yerel geçmiş hazırlanamadı.");
+                        }
+                    });
+                }
+            });
+        } catch (GeneralSecurityException | IllegalArgumentException exception) {
+            failBeforeJoin("Güvenli bağlantı hazırlanamadı.");
+        }
+    }
+
+    private void openSocket(
+            int generation,
+            String server,
+            String roomId,
+            String proof
+    ) {
+        try {
             chatClient = new ChatClient(server, roomId, proof, new ChatClient.Listener() {
                 @Override
                 public void onJoined(boolean supportsMedia) {
@@ -273,6 +362,7 @@ public final class ChatService extends Service {
                         connected = true;
                         mediaSupported = supportsMedia;
                         updateForegroundNotification();
+                        scheduleHistoryExpiry();
                         emitState();
                         if (!supportsMedia) {
                             addSystemEvent(
@@ -313,8 +403,8 @@ public final class ChatService extends Service {
                 }
             });
             chatClient.connect();
-        } catch (GeneralSecurityException | IllegalArgumentException exception) {
-            failBeforeJoin("Güvenli bağlantı hazırlanamadı.");
+        } catch (IllegalArgumentException exception) {
+            failBeforeJoin("Bağlantı adresi açılamadı.");
         }
     }
 
@@ -631,11 +721,16 @@ public final class ChatService extends Service {
     }
 
     private void addEvent(ChatEvent event) {
-        if (events.size() >= MAX_EVENTS) {
-            ChatEvent removed = events.remove(0);
-            if (removed.mediaFile != null) {
-                removed.mediaFile.delete();
+        if (event.type != ChatEvent.TYPE_SYSTEM) {
+            expireHistoryIfNeeded();
+            if (historyExpiresAt <= 0) {
+                historyExpiresAt = System.currentTimeMillis() + retentionMs;
+                scheduleHistoryExpiry();
             }
+        }
+        ChatEvent removed = null;
+        if (events.size() >= MAX_EVENTS) {
+            removed = events.remove(0);
         }
         events.add(event);
         Listener currentListener = listener;
@@ -645,10 +740,128 @@ public final class ChatService extends Service {
         if (!appVisible && !event.own && event.type != ChatEvent.TYPE_SYSTEM) {
             showMessageNotification();
         }
+        ChatEvent removedEvent = removed;
+        String activeRoomKey = roomKey;
+        int generation = connectionGeneration;
+        long eventHistoryCycle = historyCycle;
+        if (event.type != ChatEvent.TYPE_SYSTEM && !activeRoomKey.isEmpty()) {
+            storageExecutor.execute(() -> {
+                try {
+                    long expiresAt = localStore.appendEvent(activeRoomKey, event);
+                    mainHandler.post(() -> {
+                        if (
+                                generation == connectionGeneration &&
+                                activeRoomKey.equals(roomKey) &&
+                                eventHistoryCycle == historyCycle &&
+                                expiresAt > 0
+                        ) {
+                            historyExpiresAt = expiresAt;
+                            scheduleHistoryExpiry();
+                        }
+                    });
+                } catch (IOException | GeneralSecurityException exception) {
+                    emitStoreWarning(generation);
+                } finally {
+                    deleteEventFile(removedEvent);
+                }
+            });
+        } else {
+            deleteEventFile(removedEvent);
+        }
     }
 
     private void addSystemEvent(String message) {
         addEvent(ChatEvent.system(nextEventId++, message));
+    }
+
+    private void replaceHistory(List<ChatEvent> history) {
+        events.clear();
+        long highestId = 0;
+        for (ChatEvent event : history) {
+            events.add(event);
+            highestId = Math.max(highestId, event.id);
+        }
+        nextEventId = highestId + 1;
+        Listener currentListener = listener;
+        if (currentListener != null) {
+            currentListener.onHistoryReset(new ArrayList<>(events));
+        }
+    }
+
+    private void expireHistoryIfNeeded() {
+        if (historyExpiresAt > 0 && System.currentTimeMillis() >= historyExpiresAt) {
+            expireHistoryNow();
+        }
+    }
+
+    private void handleHistoryExpiry() {
+        if (historyExpiresAt <= 0) {
+            return;
+        }
+        if (System.currentTimeMillis() < historyExpiresAt) {
+            scheduleHistoryExpiry();
+            return;
+        }
+        expireHistoryNow();
+    }
+
+    private void expireHistoryNow() {
+        mainHandler.removeCallbacks(historyExpiryRunnable);
+        historyCycle++;
+        String expiredRoomKey = roomKey;
+        int generation = connectionGeneration;
+        List<ChatEvent> expiredEvents = new ArrayList<>(events);
+        events.clear();
+        historyExpiresAt = 0;
+        Listener currentListener = listener;
+        if (currentListener != null) {
+            currentListener.onHistoryReset(new ArrayList<>());
+        }
+        if (!expiredRoomKey.isEmpty()) {
+            storageExecutor.execute(() -> {
+                try {
+                    localStore.clearHistory(expiredRoomKey);
+                } catch (IOException | GeneralSecurityException exception) {
+                    emitStoreWarning(generation);
+                } finally {
+                    for (ChatEvent event : expiredEvents) {
+                        deleteEventFile(event);
+                    }
+                }
+            });
+        } else {
+            for (ChatEvent event : expiredEvents) {
+                deleteEventFile(event);
+            }
+        }
+    }
+
+    private void scheduleHistoryExpiry() {
+        mainHandler.removeCallbacks(historyExpiryRunnable);
+        if (historyExpiresAt <= 0) {
+            return;
+        }
+        long delay = Math.max(1_000L, historyExpiresAt - System.currentTimeMillis());
+        mainHandler.postDelayed(historyExpiryRunnable, delay);
+    }
+
+    private void emitStoreWarning(int generation) {
+        mainHandler.post(() -> {
+            if (generation != connectionGeneration) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (now - lastStoreWarningAt > 30_000L) {
+                lastStoreWarningAt = now;
+                emitError("Yerel sohbet geçmişi kaydedilemedi.");
+            }
+        });
+    }
+
+    private static void deleteEventFile(ChatEvent event) {
+        if (event != null && event.mediaFile != null) {
+            event.mediaFile.delete();
+        }
     }
 
     private void handleDisconnected(int generation) {
@@ -673,11 +886,22 @@ public final class ChatService extends Service {
     }
 
     private void failBeforeJoin(String message) {
+        connectionGeneration++;
+        historyCycle++;
+        mainHandler.removeCallbacks(historyExpiryRunnable);
+        ChatClient failedClient = chatClient;
+        chatClient = null;
+        if (failedClient != null) {
+            failedClient.close();
+        }
+        File failedSessionDirectory = sessionDirectory;
+        sessionDirectory = null;
         connecting = false;
         connected = false;
         mediaSupported = false;
-        chatClient = null;
         cryptoBox = null;
+        historyExpiresAt = 0;
+        storageExecutor.execute(() -> clearDirectory(failedSessionDirectory));
         stopForeground(STOP_FOREGROUND_REMOVE);
         emitError(message);
         emitState();
@@ -693,7 +917,8 @@ public final class ChatService extends Service {
                     roomName,
                     displayName,
                     presence,
-                    mediaSupported
+                    mediaSupported,
+                    retentionMs
             );
         }
     }
@@ -748,16 +973,6 @@ public final class ChatService extends Service {
             incoming.abort();
         }
         incomingMedia.clear();
-    }
-
-    private void clearEvents() {
-        for (ChatEvent event : events) {
-            if (event.mediaFile != null) {
-                event.mediaFile.delete();
-            }
-        }
-        events.clear();
-        nextEventId = 1;
     }
 
     private void createNotificationChannels() {
@@ -897,9 +1112,22 @@ public final class ChatService extends Service {
         file.delete();
     }
 
+    private void clearSessionDirectories() {
+        File[] cacheFiles = getCacheDir().listFiles();
+        if (cacheFiles == null) {
+            return;
+        }
+        for (File file : cacheFiles) {
+            if (file.getName().startsWith("session-media-")) {
+                clearDirectory(file);
+            }
+        }
+    }
+
     @Override
     public void onDestroy() {
         connectionGeneration++;
+        mainHandler.removeCallbacks(historyExpiryRunnable);
         ChatClient oldClient = chatClient;
         chatClient = null;
         if (oldClient != null) {
@@ -907,8 +1135,11 @@ public final class ChatService extends Service {
         }
         mediaExecutor.shutdownNow();
         clearIncomingMedia();
-        clearEvents();
-        clearDirectory(sessionDirectory);
+        File oldSessionDirectory = sessionDirectory;
+        sessionDirectory = null;
+        events.clear();
+        storageExecutor.execute(() -> clearDirectory(oldSessionDirectory));
+        storageExecutor.shutdown();
         cryptoBox = null;
         listener = null;
         super.onDestroy();
