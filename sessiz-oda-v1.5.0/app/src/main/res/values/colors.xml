@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ink">#18212F</color>
+    <color name="muted">#64748B</color>
+    <color name="surface">#F7F8FC</color>
+    <color name="card">#FFFFFFFF</color>
+    <color name="primary">#3157D5</color>
+    <color name="primary_dark">#2444AE</color>
+    <color name="line">#DDE3EC</color>
+    <color name="success">#147D64</color>
+</resources>
+
