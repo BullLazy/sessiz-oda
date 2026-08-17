@@ -63,13 +63,17 @@ final class CryptoBox {
         return toHex(mac.doFinal(("auth|" + roomId).getBytes(StandardCharsets.UTF_8)));
     }
 
-    String encryptText(String sender, String message) throws GeneralSecurityException {
+    String encryptText(
+            String messageId,
+            String deviceId,
+            String sender,
+            String message,
+            long sentAt,
+            ChatEvent.Reply reply
+    ) throws GeneralSecurityException {
         try {
-            JSONObject clearText = new JSONObject();
-            clearText.put("v", 1);
-            clearText.put("sender", sender);
+            JSONObject clearText = baseMessage("text", messageId, deviceId, sender, sentAt, reply);
             clearText.put("message", message);
-            clearText.put("sentAt", System.currentTimeMillis());
             return encryptObject(clearText);
         } catch (JSONException exception) {
             throw new GeneralSecurityException("Mesaj hazırlanamadı.", exception);
@@ -78,21 +82,28 @@ final class CryptoBox {
 
     String encryptMediaStart(
             String transferId,
+            String deviceId,
             String sender,
             String mimeType,
             String displayName,
-            long size
+            long size,
+            long sentAt,
+            boolean viewOnce,
+            ChatEvent.Reply reply
     ) throws GeneralSecurityException {
         try {
-            JSONObject clearText = new JSONObject();
-            clearText.put("v", 2);
-            clearText.put("type", "media_start");
-            clearText.put("id", transferId);
-            clearText.put("sender", sender);
+            JSONObject clearText = baseMessage(
+                    "media_start",
+                    transferId,
+                    deviceId,
+                    sender,
+                    sentAt,
+                    reply
+            );
             clearText.put("mime", mimeType);
             clearText.put("name", displayName);
             clearText.put("size", size);
-            clearText.put("sentAt", System.currentTimeMillis());
+            clearText.put("viewOnce", viewOnce);
             return encryptObject(clearText);
         } catch (JSONException exception) {
             throw new GeneralSecurityException("Medya bilgisi hazırlanamadı.", exception);
@@ -104,18 +115,19 @@ final class CryptoBox {
         if (length <= 0 || length > MEDIA_CHUNK_BYTES || length > data.length) {
             throw new GeneralSecurityException("Medya parçası geçersiz.");
         }
+        byte[] exactData = Arrays.copyOf(data, length);
         try {
-            byte[] exactData = Arrays.copyOf(data, length);
             JSONObject clearText = new JSONObject();
             clearText.put("v", 2);
             clearText.put("type", "media_chunk");
             clearText.put("id", transferId);
             clearText.put("index", index);
             clearText.put("data", Base64.encodeToString(exactData, Base64.NO_WRAP));
-            Arrays.fill(exactData, (byte) 0);
             return encryptObject(clearText);
         } catch (JSONException exception) {
             throw new GeneralSecurityException("Medya parçası hazırlanamadı.", exception);
+        } finally {
+            Arrays.fill(exactData, (byte) 0);
         }
     }
 
@@ -134,78 +146,188 @@ final class CryptoBox {
         }
     }
 
+    String encryptReceipt(String messageId, String deviceId, String state)
+            throws GeneralSecurityException {
+        if (!"delivered".equals(state) && !"seen".equals(state)) {
+            throw new GeneralSecurityException("Teslim bilgisi geçersiz.");
+        }
+        try {
+            JSONObject clearText = new JSONObject();
+            clearText.put("v", 3);
+            clearText.put("type", "receipt");
+            clearText.put("id", validateMessageId(messageId));
+            clearText.put("device", validateDeviceId(deviceId));
+            clearText.put("state", state);
+            return encryptObject(clearText);
+        } catch (JSONException exception) {
+            throw new GeneralSecurityException("Teslim bilgisi hazırlanamadı.", exception);
+        }
+    }
+
     DecryptedPacket decryptPacket(String payload) throws GeneralSecurityException {
         try {
             JSONObject clearText = decryptObject(payload);
             int version = clearText.optInt("v", 0);
             if (version == 1) {
                 String sender = validateSender(clearText.getString("sender"));
-                String message = clearText.getString("message");
-                if (message.trim().isEmpty() || message.length() > 2_000) {
-                    throw new GeneralSecurityException("Mesaj içeriği geçersiz.");
-                }
-                return DecryptedPacket.text(sender, message, readTimestamp(clearText));
+                String message = validateMessage(clearText.getString("message"));
+                return DecryptedPacket.text(
+                        null,
+                        null,
+                        sender,
+                        message,
+                        readTimestamp(clearText),
+                        null
+                );
             }
-            if (version != 2) {
+            if (version == 2) {
+                return decryptVersionTwo(clearText);
+            }
+            if (version != 3) {
                 throw new GeneralSecurityException("Mesaj sürümü desteklenmiyor.");
             }
 
             String type = clearText.optString("type", "");
-            String transferId = validateTransferId(clearText.optString("id", ""));
-            switch (type) {
-                case "media_start": {
-                    String sender = validateSender(clearText.getString("sender"));
-                    String mimeType = clearText.getString("mime");
-                    String name = clearText.getString("name");
-                    long size = clearText.getLong("size");
-                    long mediaLimit = mimeType.startsWith("image/")
-                            ? MAX_IMAGE_BYTES
-                            : MAX_VIDEO_BYTES;
-                    if (
-                            (!mimeType.startsWith("image/") && !mimeType.startsWith("video/")) ||
-                            mimeType.length() > 80 ||
-                            name.trim().isEmpty() ||
-                            name.length() > 120 ||
-                            size <= 0 ||
-                            size > mediaLimit
-                    ) {
-                        throw new GeneralSecurityException("Medya bilgisi geçersiz.");
-                    }
-                    return DecryptedPacket.mediaStart(
-                            transferId,
-                            sender,
-                            mimeType,
-                            name,
-                            size,
-                            readTimestamp(clearText)
-                    );
+            String messageId = validateMessageId(clearText.optString("id", ""));
+            String deviceId = validateDeviceId(clearText.optString("device", ""));
+            if ("receipt".equals(type)) {
+                String state = clearText.optString("state", "");
+                if (!"delivered".equals(state) && !"seen".equals(state)) {
+                    throw new GeneralSecurityException("Teslim bilgisi geçersiz.");
                 }
-                case "media_chunk": {
-                    int index = clearText.getInt("index");
-                    if (index < 0 || index >= MAX_MEDIA_CHUNKS) {
-                        throw new GeneralSecurityException("Medya sırası geçersiz.");
-                    }
-                    byte[] data = Base64.decode(clearText.getString("data"), Base64.NO_WRAP);
-                    if (data.length == 0 || data.length > MEDIA_CHUNK_BYTES) {
-                        Arrays.fill(data, (byte) 0);
-                        throw new GeneralSecurityException("Medya parçası geçersiz.");
-                    }
-                    return DecryptedPacket.mediaChunk(transferId, index, data);
-                }
-                case "media_end": {
-                    int chunks = clearText.getInt("chunks");
-                    String digest = clearText.getString("sha256");
-                    if (chunks <= 0 || chunks > MAX_MEDIA_CHUNKS || !digest.matches("^[a-f0-9]{64}$")) {
-                        throw new GeneralSecurityException("Medya doğrulaması geçersiz.");
-                    }
-                    return DecryptedPacket.mediaEnd(transferId, chunks, digest);
-                }
-                default:
-                    throw new GeneralSecurityException("Mesaj türü desteklenmiyor.");
+                return DecryptedPacket.receipt(messageId, deviceId, state);
             }
+
+            String sender = validateSender(clearText.getString("sender"));
+            long sentAt = readTimestamp(clearText);
+            ChatEvent.Reply reply = readReply(clearText);
+            if ("text".equals(type)) {
+                return DecryptedPacket.text(
+                        messageId,
+                        deviceId,
+                        sender,
+                        validateMessage(clearText.getString("message")),
+                        sentAt,
+                        reply
+                );
+            }
+            if ("media_start".equals(type)) {
+                String mimeType = clearText.getString("mime");
+                String name = clearText.getString("name");
+                long size = clearText.getLong("size");
+                validateMedia(mimeType, name, size);
+                return DecryptedPacket.mediaStart(
+                        messageId,
+                        deviceId,
+                        sender,
+                        mimeType,
+                        name,
+                        size,
+                        sentAt,
+                        clearText.optBoolean("viewOnce", false),
+                        reply
+                );
+            }
+            throw new GeneralSecurityException("Mesaj türü desteklenmiyor.");
         } catch (IllegalArgumentException | JSONException exception) {
             throw new GeneralSecurityException("Şifreli paket açılamadı.", exception);
         }
+    }
+
+    private DecryptedPacket decryptVersionTwo(JSONObject clearText)
+            throws JSONException, GeneralSecurityException {
+        String type = clearText.optString("type", "");
+        String transferId = validateMessageId(clearText.optString("id", ""));
+        switch (type) {
+            case "media_start": {
+                String sender = validateSender(clearText.getString("sender"));
+                String mimeType = clearText.getString("mime");
+                String name = clearText.getString("name");
+                long size = clearText.getLong("size");
+                validateMedia(mimeType, name, size);
+                return DecryptedPacket.mediaStart(
+                        transferId,
+                        null,
+                        sender,
+                        mimeType,
+                        name,
+                        size,
+                        readTimestamp(clearText),
+                        false,
+                        null
+                );
+            }
+            case "media_chunk": {
+                int index = clearText.getInt("index");
+                if (index < 0 || index >= MAX_MEDIA_CHUNKS) {
+                    throw new GeneralSecurityException("Medya sırası geçersiz.");
+                }
+                byte[] data = Base64.decode(clearText.getString("data"), Base64.NO_WRAP);
+                if (data.length == 0 || data.length > MEDIA_CHUNK_BYTES) {
+                    Arrays.fill(data, (byte) 0);
+                    throw new GeneralSecurityException("Medya parçası geçersiz.");
+                }
+                return DecryptedPacket.mediaChunk(transferId, index, data);
+            }
+            case "media_end": {
+                int chunks = clearText.getInt("chunks");
+                String digest = clearText.getString("sha256");
+                if (
+                        chunks <= 0 ||
+                        chunks > MAX_MEDIA_CHUNKS ||
+                        !digest.matches("^[a-f0-9]{64}$")
+                ) {
+                    throw new GeneralSecurityException("Medya doğrulaması geçersiz.");
+                }
+                return DecryptedPacket.mediaEnd(transferId, chunks, digest);
+            }
+            default:
+                throw new GeneralSecurityException("Mesaj türü desteklenmiyor.");
+        }
+    }
+
+    private JSONObject baseMessage(
+            String type,
+            String messageId,
+            String deviceId,
+            String sender,
+            long sentAt,
+            ChatEvent.Reply reply
+    ) throws JSONException, GeneralSecurityException {
+        JSONObject clearText = new JSONObject();
+        clearText.put("v", 3);
+        clearText.put("type", type);
+        clearText.put("id", validateMessageId(messageId));
+        clearText.put("device", validateDeviceId(deviceId));
+        clearText.put("sender", validateSender(sender));
+        clearText.put("sentAt", sentAt);
+        if (reply != null) {
+            JSONObject replyObject = new JSONObject();
+            replyObject.put("id", validateMessageId(reply.messageId));
+            replyObject.put("sender", validateSender(reply.sender));
+            String preview = reply.preview == null ? "" : reply.preview.trim();
+            if (preview.isEmpty() || preview.length() > 160) {
+                throw new GeneralSecurityException("Yanıt özeti geçersiz.");
+            }
+            replyObject.put("preview", preview);
+            clearText.put("reply", replyObject);
+        }
+        return clearText;
+    }
+
+    private ChatEvent.Reply readReply(JSONObject clearText)
+            throws JSONException, GeneralSecurityException {
+        JSONObject reply = clearText.optJSONObject("reply");
+        if (reply == null) {
+            return null;
+        }
+        String messageId = validateMessageId(reply.optString("id", ""));
+        String sender = validateSender(reply.optString("sender", ""));
+        String preview = reply.optString("preview", "").trim();
+        if (preview.isEmpty() || preview.length() > 160) {
+            throw new GeneralSecurityException("Yanıt özeti geçersiz.");
+        }
+        return new ChatEvent.Reply(messageId, sender, preview);
     }
 
     private String encryptObject(JSONObject clearText) throws GeneralSecurityException {
@@ -254,17 +376,50 @@ final class CryptoBox {
     }
 
     private static String validateSender(String sender) throws GeneralSecurityException {
-        if (sender.trim().isEmpty() || sender.length() > 24) {
+        if (sender == null || sender.trim().isEmpty() || sender.length() > 24) {
             throw new GeneralSecurityException("Gönderen geçersiz.");
         }
         return sender;
     }
 
-    private static String validateTransferId(String transferId) throws GeneralSecurityException {
-        if (!transferId.matches("^[a-f0-9]{32}$")) {
-            throw new GeneralSecurityException("Medya kimliği geçersiz.");
+    private static String validateMessage(String message) throws GeneralSecurityException {
+        if (message == null || message.trim().isEmpty() || message.length() > 2_000) {
+            throw new GeneralSecurityException("Mesaj içeriği geçersiz.");
         }
-        return transferId;
+        return message;
+    }
+
+    private static String validateMessageId(String messageId) throws GeneralSecurityException {
+        if (messageId == null || !messageId.matches("^[a-f0-9]{32}$")) {
+            throw new GeneralSecurityException("Mesaj kimliği geçersiz.");
+        }
+        return messageId;
+    }
+
+    private static String validateDeviceId(String deviceId) throws GeneralSecurityException {
+        if (deviceId == null || !deviceId.matches("^[a-f0-9]{32}$")) {
+            throw new GeneralSecurityException("Cihaz kimliği geçersiz.");
+        }
+        return deviceId;
+    }
+
+    private static void validateMedia(String mimeType, String name, long size)
+            throws GeneralSecurityException {
+        long mediaLimit = mimeType != null && mimeType.startsWith("image/")
+                ? MAX_IMAGE_BYTES
+                : MAX_VIDEO_BYTES;
+        if (
+                mimeType == null ||
+                (!mimeType.startsWith("image/") && !mimeType.startsWith("video/")) ||
+                mimeType.length() > 80 ||
+                name == null ||
+                name.trim().isEmpty() ||
+                name.length() > 120 ||
+                size <= 0 ||
+                size > mediaLimit
+        ) {
+            throw new GeneralSecurityException("Medya bilgisi geçersiz.");
+        }
     }
 
     private static long readTimestamp(JSONObject clearText) {
@@ -303,69 +458,114 @@ final class CryptoBox {
         static final String MEDIA_START = "media_start";
         static final String MEDIA_CHUNK = "media_chunk";
         static final String MEDIA_END = "media_end";
+        static final String RECEIPT = "receipt";
 
         final String type;
+        final String messageId;
         final String transferId;
+        final String deviceId;
         final String sender;
         final String text;
         final String mimeType;
         final String displayName;
         final String digest;
+        final String receiptState;
         final long size;
         final long sentAt;
         final int index;
         final int chunks;
         final byte[] data;
+        final ChatEvent.Reply reply;
+        final boolean viewOnce;
 
         private DecryptedPacket(
                 String type,
+                String messageId,
                 String transferId,
+                String deviceId,
                 String sender,
                 String text,
                 String mimeType,
                 String displayName,
                 String digest,
+                String receiptState,
                 long size,
                 long sentAt,
                 int index,
                 int chunks,
-                byte[] data
+                byte[] data,
+                ChatEvent.Reply reply,
+                boolean viewOnce
         ) {
             this.type = type;
+            this.messageId = messageId;
             this.transferId = transferId;
+            this.deviceId = deviceId;
             this.sender = sender;
             this.text = text;
             this.mimeType = mimeType;
             this.displayName = displayName;
             this.digest = digest;
+            this.receiptState = receiptState;
             this.size = size;
             this.sentAt = sentAt;
             this.index = index;
             this.chunks = chunks;
             this.data = data;
+            this.reply = reply;
+            this.viewOnce = viewOnce;
         }
 
-        static DecryptedPacket text(String sender, String text, long sentAt) {
-            return new DecryptedPacket(TEXT, null, sender, text, null, null, null, 0, sentAt, 0, 0, null);
+        static DecryptedPacket text(
+                String messageId,
+                String deviceId,
+                String sender,
+                String text,
+                long sentAt,
+                ChatEvent.Reply reply
+        ) {
+            return new DecryptedPacket(
+                    TEXT, messageId, null, deviceId, sender, text, null, null,
+                    null, null, 0, sentAt, 0, 0, null, reply, false
+            );
         }
 
         static DecryptedPacket mediaStart(
                 String id,
+                String deviceId,
                 String sender,
                 String mime,
                 String name,
                 long size,
-                long sentAt
+                long sentAt,
+                boolean viewOnce,
+                ChatEvent.Reply reply
         ) {
-            return new DecryptedPacket(MEDIA_START, id, sender, null, mime, name, null, size, sentAt, 0, 0, null);
+            return new DecryptedPacket(
+                    MEDIA_START, id, id, deviceId, sender, null, mime, name,
+                    null, null, size, sentAt, 0, 0, null, reply, viewOnce
+            );
         }
 
         static DecryptedPacket mediaChunk(String id, int index, byte[] data) {
-            return new DecryptedPacket(MEDIA_CHUNK, id, null, null, null, null, null, 0, 0, index, 0, data);
+            return new DecryptedPacket(
+                    MEDIA_CHUNK, null, id, null, null, null, null, null,
+                    null, null, 0, 0, index, 0, data, null, false
+            );
         }
 
         static DecryptedPacket mediaEnd(String id, int chunks, String digest) {
-            return new DecryptedPacket(MEDIA_END, id, null, null, null, null, digest, 0, 0, 0, chunks, null);
+            return new DecryptedPacket(
+                    MEDIA_END, null, id, null, null, null, null, null,
+                    digest, null, 0, 0, 0, chunks, null, null, false
+            );
+        }
+
+        static DecryptedPacket receipt(String id, String deviceId, String state) {
+            return new DecryptedPacket(
+                    RECEIPT, id, null, deviceId, null, null, null, null,
+                    null, state, 0, 0, 0, 0, null, null, false
+            );
         }
     }
 }

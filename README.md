@@ -15,12 +15,16 @@ Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygul
 - Ortak parolanın hiçbir zaman kalıcı olarak kaydedilmemesi
 - Daha önce girilen odaları tek dokunuşla dolduran kayıtlı oda kartları
 - Mesajlarda cihazın saat biçimine uygun gönderim saati
-- Mesaja uzun basarak metni panoya kopyalama
+- Mesaja uzun basarak metni panoya kopyalama veya WhatsApp benzeri yanıt verme
+- Yanıtlanan iletinin gönderenini ve kısa özetini yeni mesajın içinde gösterme
 - Yazma alanının ekran klavyesinin üzerinde kalması
 - Tek karakterli iletilerde de ad, mesaj ve saati düzgün gösteren sabit genişlikte balon
 - Telefon yatay veya dikey çevrildiğinde açık oturumun korunması
 - Uygulama arka planda veya son uygulamalardan kapatılmışken kayıtlı odalar için içeriği göstermeyen bildirim
 - Bağlı oda üyeleri arasında uçtan uca şifreli görsel ve video aktarımı
+- Normal görsel ve videoları Android dosya seçicisiyle telefona indirme
+- İndirilemeyen, yerel geçmişe kaydedilmeyen ve yalnız bir kez açılan görsel/video gönderimi
+- Sunucunun kabul ettiği ileti için tek tik, tüm alıcılara teslimde çift tik ve tüm alıcılar gördüğünde mavi çift tik
 - 100 MB görsel ve 500 MB video üst sınırı; medya aktarılırken metin mesajlarının beklemeden ilerlemesi
 - Yoğun mesaj veya medya trafiğinde kullanıcıyı odadan atan hız/MB zaman aşımının kaldırılması
 - Aynı cihaz yeniden bağlandığında eski oturumun anında değiştirilmesi ve hayalet kişi sayısının önlenmesi
@@ -32,7 +36,7 @@ Sessiz Oda, küçük özel gruplar için hazırlanmış bir Android sohbet uygul
 
 GitHub Actions yalnızca Android APK'sini üretir. Sohbetin çalışması için `server/` klasöründeki relay uygulamasının internette açık ve TLS kullanan bir sunucuda çalışması gerekir. Uygulamaya bu adres `wss://alan-adiniz.com/chat` biçiminde girilir.
 
-Bu sürümde `server/server.js` de değişti. ZIP'i GitHub'a yükledikten sonra APK'yı almak tek başına yeterli değildir; Render servisinde son commit'i yeniden dağıtın. Eski relay çalışırsa büyük medya/yoğun mesaj kopma düzeltmeleri, hayalet oturum temizliği ve kayıtlı oda bildirimleri devreye girmez.
+Bu sürümde `server/server.js` protokol 4'e geçti. ZIP'i GitHub'a yükledikten sonra APK'yı almak tek başına yeterli değildir; Render servisinde son commit'i yeniden dağıtın. Eski relay çalışırsa tek gösterimlik medya ile teslim/görüldü bilgisi devreye girmez.
 
 ## 1. Sunucuyu çalıştırın
 
@@ -88,9 +92,14 @@ Sunucunun kendisi hiçbir `console` çıktısı, dosya, veritabanı veya mesaj k
 - Görseller en fazla 100 MB, videolar en fazla 500 MB olabilir. Büyük aktarım sırasında metin mesajları küçük bir WebSocket kuyruğuyla öncelikli ilerler.
 - Bir alıcının ağı yavaşlarsa relay göndereni odadan atmak yerine akışı geçici olarak yavaşlatır; birikmiş veriyi sınırsız biçimde belleğe doldurmaz.
 - Medya sunucuda veya harici depolamada tutulmaz. Yalnız o anda bağlı ve medya desteği bulunan cihazlara şifreli parçalar hâlinde iletilir.
+- Normal medya, iletiye uzun basılıp **İndir** seçildiğinde kullanıcının belirlediği dosyaya kopyalanır. Bu kopya artık uygulamanın süreli geçmişinden bağımsızdır.
+- Tek gösterimlik medya önizleme oluşturmadan gösterilir, Android ekran yakalama korumasıyla açılır, indirilemez, açıldıktan sonra geçici dosyası silinir ve şifreli yerel geçmişe hiç yazılmaz.
+- Android tarafındaki bu koruma değiştirilmiş bir uygulamayı veya ekranı başka bir kamerayla kaydetmeyi teknik olarak engelleyemez.
 - Çevrimdışı kullanıcıya mesaj veya medya sonradan teslim edilmez.
 - Alınan medya, oda süresi dolana kadar uygulamanın özel alanında cihaz anahtarıyla şifreli saklanır. Görüntülemek için açılan geçici kopyalar odadan çıkınca veya sonraki servis başlangıcında temizlenir.
 - Uygulama, relay'in medya ve bildirim protokolünü katılım sırasında doğrular. Render eski sürümdeyse ilgili özellik için yeniden dağıtım uyarısı verir.
+- Teslim/görüldü makbuzlarının ileti kimliği, cihaz kimliği ve durumu oda anahtarıyla uçtan uca şifrelenir. Relay yalnız paketin makbuz sınıfında olduğunu ve zamanını görebilir.
+- Grup odalarında çift tik, gönderim anında bağlı olan tüm hedef cihazların teslim/görüldü makbuzu geldiğinde gösterilir. O anda odada başka kimse yoksa ileti tek tikte kalır.
 
 ## Süreli oda geçmişi
 
@@ -148,7 +157,7 @@ Tam anlamıyla “dünyanın hiçbir katmanında log yok” garantisi uygulama k
 - **Kişi sayısı bir fazla:** Tüm telefonlarda yeni APK'nın, Render'da da son sunucu sürümünün çalıştığını kontrol edin. Aynı cihazın eski bağlantısı artık yeni oturum geldiği anda değiştirilir.
 - **Bildirim gelmiyor:** Android uygulama ayarlarından Sessiz Oda bildirim iznini ve pil kullanımında arka plan çalışmasını kontrol edin.
 - **Medya gitmiyor:** İki cihazın da güncel APK'yı kullandığını, o anda odaya bağlı olduğunu ve dosyanın boyut sınırını aşmadığını kontrol edin.
-- **“Sunucu eski sürümde” uyarısı:** Render'da **Manual Deploy → Deploy latest commit** çalıştırın. Ardından `/health` yanıtında `"protocol":3`, `"media":true` ve `"notifications":true` bulunduğunu kontrol edin.
+- **“Sunucu eski sürümde” uyarısı:** Render'da **Manual Deploy → Deploy latest commit** çalıştırın. Ardından `/health` yanıtında `"protocol":4`, `"media":true`, `"notifications":true` ve `"receipts":true` bulunduğunu kontrol edin.
 - **APK güncellenmiyor:** Eski debug APK'yı kaldırıp yenisini kurun.
 
 ## Proje yapısı

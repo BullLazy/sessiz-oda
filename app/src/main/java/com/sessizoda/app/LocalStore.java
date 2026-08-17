@@ -182,7 +182,7 @@ final class LocalStore {
 
     synchronized long appendEvent(String roomKey, ChatEvent event)
             throws IOException, GeneralSecurityException {
-        if (event.type == ChatEvent.TYPE_SYSTEM) {
+        if (event.type == ChatEvent.TYPE_SYSTEM || event.viewOnce) {
             return 0;
         }
         ensureLoaded();
@@ -235,6 +235,25 @@ final class LocalStore {
         return RetentionPolicy.expiresAt(room.historyStartedAt, room.retentionMs);
     }
 
+    synchronized void updateEventStatus(String roomKey, String messageId, int status)
+            throws IOException, GeneralSecurityException {
+        if (!validHex(messageId, 32) || status < ChatEvent.STATUS_SENT || status > ChatEvent.STATUS_SEEN) {
+            return;
+        }
+        ensureLoaded();
+        RoomRecord room = state.rooms.get(roomKey);
+        if (room == null) {
+            return;
+        }
+        for (StoredEvent event : room.events) {
+            if (messageId.equals(event.messageId) && status > event.deliveryStatus) {
+                event.deliveryStatus = status;
+                saveState();
+                return;
+            }
+        }
+    }
+
     synchronized void clearHistory(String roomKey)
             throws IOException, GeneralSecurityException {
         ensureLoaded();
@@ -258,13 +277,17 @@ final class LocalStore {
         Iterator<StoredEvent> iterator = room.events.iterator();
         while (iterator.hasNext()) {
             StoredEvent stored = iterator.next();
+            ChatEvent.Reply reply = stored.reply();
             if (stored.type == ChatEvent.TYPE_TEXT) {
                 result.add(ChatEvent.text(
                         stored.id,
+                        stored.messageId,
                         stored.sender,
                         stored.text,
                         stored.sentAt,
-                        stored.own
+                        stored.own,
+                        reply,
+                        stored.deliveryStatus
                 ));
                 continue;
             }
@@ -277,13 +300,18 @@ final class LocalStore {
                 decryptMedia(encrypted, plain, stored.size);
                 result.add(ChatEvent.media(
                         stored.id,
+                        stored.messageId,
                         stored.sender,
                         stored.sentAt,
                         stored.own,
                         plain,
                         stored.mimeType,
                         stored.displayName,
-                        stored.size
+                        stored.size,
+                        reply,
+                        false,
+                        false,
+                        stored.deliveryStatus
                 ));
             } catch (IOException | GeneralSecurityException exception) {
                 plain.delete();
@@ -332,201 +360,59 @@ final class LocalStore {
 
     private void saveState() throws IOException, GeneralSecurityException {
         ensureDirectories();
-        byte[] clear;
-        try {
-            clear = state.toJson().toString().getBytes(StandardCharsets.UTF_8);
-        } catch (JSONException exception) {
-            throw new IOException("Yerel geçmiş hazırlanamadı.", exception);
-        }
-        byte[] encrypted = encryptBytes(clear, STATE_MAGIC);
-        Arrays.fill(clear, (byte) 0);
+        byte[] clear = state.toJson().toString().getBytes(StandardCharsets.UTF_8);
+        byte[] encrypted = null;
         File temporary = new File(rootDirectory, "state.tmp");
-        try (FileOutputStream output = new FileOutputStream(temporary, false)) {
-            output.write(encrypted);
-            output.flush();
-            output.getFD().sync();
+        try {
+            encrypted = encryptBytes(clear, STATE_MAGIC);
+            try (FileOutputStream output = new FileOutputStream(temporary, false)) {
+                output.write(encrypted);
+                output.flush();
+                output.getFD().sync();
+            }
+            moveReplacing(temporary, stateFile);
+            state.dirty = false;
         } finally {
-            Arrays.fill(encrypted, (byte) 0);
-        }
-        moveReplacing(temporary, stateFile);
-        state.dirty = false;
-    }
-
-    private void ensureDirectories() throws IOException {
-        if (!rootDirectory.isDirectory() && !rootDirectory.mkdirs()) {
-            throw new IOException("Yerel veri alanı hazırlanamadı.");
-        }
-        if (!mediaDirectory.isDirectory() && !mediaDirectory.mkdirs()) {
-            throw new IOException("Yerel medya alanı hazırlanamadı.");
-        }
-    }
-
-    private boolean pruneExpired(RoomRecord room, long now) {
-        if (!RetentionPolicy.isExpired(room.historyStartedAt, room.retentionMs, now)) {
-            return false;
-        }
-        for (String mediaId : mediaIds(room.events)) {
-            deleteEncryptedMedia(mediaId);
-        }
-        room.events.clear();
-        room.historyStartedAt = 0;
-        return true;
-    }
-
-    private void trimRooms() {
-        while (state.rooms.size() > MAX_ROOMS) {
-            RoomRecord oldest = state.rooms.values().stream()
-                    .min(Comparator.comparingLong(value -> value.lastJoinedAt))
-                    .orElse(null);
-            if (oldest == null) {
-                return;
+            Arrays.fill(clear, (byte) 0);
+            if (encrypted != null) {
+                Arrays.fill(encrypted, (byte) 0);
             }
-            state.rooms.remove(oldest.key);
-            for (String mediaId : mediaIds(oldest.events)) {
-                deleteEncryptedMedia(mediaId);
-            }
-        }
-    }
-
-    private void cleanupOrphanedMedia() {
-        Set<String> expected = new HashSet<>();
-        for (RoomRecord room : state.rooms.values()) {
-            for (StoredEvent event : room.events) {
-                if (event.mediaId != null) {
-                    expected.add(event.mediaId + ".enc");
-                }
-            }
-        }
-        File[] files = mediaDirectory.listFiles();
-        if (files == null) {
-            return;
-        }
-        for (File file : files) {
-            if (!expected.contains(file.getName())) {
-                file.delete();
-            }
-        }
-    }
-
-    private void encryptMedia(File source, File destination)
-            throws IOException, GeneralSecurityException {
-        ensureDirectories();
-        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey());
-        byte[] nonce = cipher.getIV();
-        File temporary = new File(mediaDirectory, destination.getName() + ".tmp");
-        byte[] buffer = new byte[BUFFER_BYTES];
-        try (
-                FileInputStream input = new FileInputStream(source);
-                FileOutputStream output = new FileOutputStream(temporary, false)
-        ) {
-            output.write(MEDIA_MAGIC);
-            output.write(nonce);
-            int read;
-            while ((read = input.read(buffer)) != -1) {
-                byte[] encrypted = cipher.update(buffer, 0, read);
-                if (encrypted != null) {
-                    output.write(encrypted);
-                    Arrays.fill(encrypted, (byte) 0);
-                }
-            }
-            byte[] finalBytes = cipher.doFinal();
-            output.write(finalBytes);
-            Arrays.fill(finalBytes, (byte) 0);
-            output.flush();
-            output.getFD().sync();
-        } catch (IOException | GeneralSecurityException exception) {
             temporary.delete();
-            throw exception;
-        } finally {
-            Arrays.fill(buffer, (byte) 0);
-            Arrays.fill(nonce, (byte) 0);
         }
-        moveReplacing(temporary, destination);
-    }
-
-    private void decryptMedia(File source, File destination, long expectedSize)
-            throws IOException, GeneralSecurityException {
-        if (!source.isFile()) {
-            throw new IOException("Kayıtlı medya bulunamadı.");
-        }
-        if (source.length() != expectedSize + MEDIA_MAGIC.length + NONCE_BYTES + 16L) {
-            throw new IOException("Kayıtlı medya boyutu geçersiz.");
-        }
-        byte[] header = new byte[MEDIA_MAGIC.length];
-        byte[] nonce = new byte[NONCE_BYTES];
-        byte[] buffer = new byte[BUFFER_BYTES];
-        long written = 0;
-        File temporary = new File(destination.getParentFile(), destination.getName() + ".tmp");
-        try (
-                FileInputStream input = new FileInputStream(source);
-                FileOutputStream output = new FileOutputStream(temporary, false)
-        ) {
-            readFully(input, header);
-            readFully(input, nonce);
-            if (!Arrays.equals(header, MEDIA_MAGIC)) {
-                throw new IOException("Kayıtlı medya biçimi geçersiz.");
-            }
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(TAG_BITS, nonce));
-            int read;
-            while ((read = input.read(buffer)) != -1) {
-                byte[] clear = cipher.update(buffer, 0, read);
-                if (clear != null) {
-                    output.write(clear);
-                    written += clear.length;
-                    Arrays.fill(clear, (byte) 0);
-                }
-            }
-            byte[] finalBytes = cipher.doFinal();
-            output.write(finalBytes);
-            written += finalBytes.length;
-            Arrays.fill(finalBytes, (byte) 0);
-            output.flush();
-            output.getFD().sync();
-        } catch (IOException | GeneralSecurityException exception) {
-            temporary.delete();
-            throw exception;
-        } finally {
-            Arrays.fill(header, (byte) 0);
-            Arrays.fill(nonce, (byte) 0);
-            Arrays.fill(buffer, (byte) 0);
-        }
-        if (written != expectedSize) {
-            temporary.delete();
-            throw new IOException("Kayıtlı medya boyutu geçersiz.");
-        }
-        moveReplacing(temporary, destination);
     }
 
     private byte[] encryptBytes(byte[] clear, byte[] magic)
             throws GeneralSecurityException {
-        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey());
-        byte[] nonce = cipher.getIV();
-        byte[] body = cipher.doFinal(clear);
-        byte[] packet = new byte[magic.length + nonce.length + body.length];
-        System.arraycopy(magic, 0, packet, 0, magic.length);
-        System.arraycopy(nonce, 0, packet, magic.length, nonce.length);
-        System.arraycopy(body, 0, packet, magic.length + nonce.length, body.length);
-        Arrays.fill(nonce, (byte) 0);
-        Arrays.fill(body, (byte) 0);
-        return packet;
+        byte[] nonce = new byte[NONCE_BYTES];
+        new java.security.SecureRandom().nextBytes(nonce);
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(TAG_BITS, nonce));
+            byte[] body = cipher.doFinal(clear);
+            byte[] result = new byte[magic.length + nonce.length + body.length];
+            System.arraycopy(magic, 0, result, 0, magic.length);
+            System.arraycopy(nonce, 0, result, magic.length, nonce.length);
+            System.arraycopy(body, 0, result, magic.length + nonce.length, body.length);
+            Arrays.fill(body, (byte) 0);
+            return result;
+        } finally {
+            Arrays.fill(nonce, (byte) 0);
+        }
     }
 
     private byte[] decryptBytes(byte[] packet, byte[] magic)
-            throws GeneralSecurityException, IOException {
-        int bodyOffset = magic.length + NONCE_BYTES;
-        if (packet.length <= bodyOffset + 16) {
-            throw new IOException("Yerel veri biçimi geçersiz.");
+            throws GeneralSecurityException {
+        int minimum = magic.length + NONCE_BYTES + 16;
+        if (packet.length < minimum) {
+            throw new GeneralSecurityException("Şifreli yerel kayıt geçersiz.");
         }
         for (int index = 0; index < magic.length; index++) {
             if (packet[index] != magic[index]) {
-                throw new IOException("Yerel veri sürümü geçersiz.");
+                throw new GeneralSecurityException("Şifreli yerel kayıt geçersiz.");
             }
         }
-        byte[] nonce = Arrays.copyOfRange(packet, magic.length, bodyOffset);
-        byte[] body = Arrays.copyOfRange(packet, bodyOffset, packet.length);
+        byte[] nonce = Arrays.copyOfRange(packet, magic.length, magic.length + NONCE_BYTES);
+        byte[] body = Arrays.copyOfRange(packet, magic.length + NONCE_BYTES, packet.length);
         try {
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(TAG_BITS, nonce));
@@ -534,6 +420,99 @@ final class LocalStore {
         } finally {
             Arrays.fill(nonce, (byte) 0);
             Arrays.fill(body, (byte) 0);
+        }
+    }
+
+    private void encryptMedia(File plain, File encrypted)
+            throws IOException, GeneralSecurityException {
+        ensureDirectories();
+        byte[] nonce = new byte[NONCE_BYTES];
+        byte[] buffer = new byte[BUFFER_BYTES];
+        new java.security.SecureRandom().nextBytes(nonce);
+        try (FileInputStream input = new FileInputStream(plain);
+             FileOutputStream output = new FileOutputStream(encrypted, false)) {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey(), new GCMParameterSpec(TAG_BITS, nonce));
+            output.write(MEDIA_MAGIC);
+            output.write(nonce);
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                byte[] block = cipher.update(buffer, 0, read);
+                if (block != null) {
+                    output.write(block);
+                    Arrays.fill(block, (byte) 0);
+                }
+            }
+            byte[] finalBytes = cipher.doFinal();
+            output.write(finalBytes);
+            Arrays.fill(finalBytes, (byte) 0);
+            output.flush();
+            output.getFD().sync();
+        } catch (IOException | GeneralSecurityException exception) {
+            encrypted.delete();
+            throw exception;
+        } finally {
+            Arrays.fill(nonce, (byte) 0);
+            Arrays.fill(buffer, (byte) 0);
+        }
+    }
+
+    private void decryptMedia(File encrypted, File plain, long expectedSize)
+            throws IOException, GeneralSecurityException {
+        if (!encrypted.isFile()) {
+            throw new IOException("Şifreli medya bulunamadı.");
+        }
+        byte[] header = new byte[MEDIA_MAGIC.length + NONCE_BYTES];
+        byte[] buffer = new byte[BUFFER_BYTES];
+        long written = 0;
+        try (FileInputStream input = new FileInputStream(encrypted);
+             FileOutputStream output = new FileOutputStream(plain, false)) {
+            if (input.read(header) != header.length) {
+                throw new IOException("Şifreli medya geçersiz.");
+            }
+            for (int index = 0; index < MEDIA_MAGIC.length; index++) {
+                if (header[index] != MEDIA_MAGIC[index]) {
+                    throw new GeneralSecurityException("Şifreli medya geçersiz.");
+                }
+            }
+            byte[] nonce = Arrays.copyOfRange(header, MEDIA_MAGIC.length, header.length);
+            try {
+                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+                cipher.init(
+                        Cipher.DECRYPT_MODE,
+                        getOrCreateKey(),
+                        new GCMParameterSpec(TAG_BITS, nonce)
+                );
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    byte[] block = cipher.update(buffer, 0, read);
+                    if (block != null) {
+                        output.write(block);
+                        written += block.length;
+                        Arrays.fill(block, (byte) 0);
+                    }
+                    if (written > expectedSize) {
+                        throw new IOException("Medya boyutu geçersiz.");
+                    }
+                }
+                byte[] finalBytes = cipher.doFinal();
+                output.write(finalBytes);
+                written += finalBytes.length;
+                Arrays.fill(finalBytes, (byte) 0);
+            } finally {
+                Arrays.fill(nonce, (byte) 0);
+            }
+            if (written != expectedSize) {
+                throw new IOException("Medya boyutu geçersiz.");
+            }
+            output.flush();
+            output.getFD().sync();
+        } catch (IOException | GeneralSecurityException exception) {
+            plain.delete();
+            throw exception;
+        } finally {
+            Arrays.fill(header, (byte) 0);
+            Arrays.fill(buffer, (byte) 0);
         }
     }
 
@@ -564,59 +543,108 @@ final class LocalStore {
         return generator.generateKey();
     }
 
-    private void resetStoredData() {
-        stateFile.delete();
-        File temporary = new File(rootDirectory, "state.tmp");
-        temporary.delete();
-        File[] mediaFiles = mediaDirectory.listFiles();
-        if (mediaFiles != null) {
-            for (File file : mediaFiles) {
+    private boolean pruneExpired(RoomRecord room, long now) {
+        long expiresAt = RetentionPolicy.expiresAt(room.historyStartedAt, room.retentionMs);
+        if (expiresAt <= 0 || now < expiresAt) {
+            return false;
+        }
+        List<String> ids = mediaIds(room.events);
+        room.events.clear();
+        room.historyStartedAt = 0;
+        for (String id : ids) {
+            deleteEncryptedMedia(id);
+        }
+        state.dirty = true;
+        return true;
+    }
+
+    private void trimRooms() {
+        while (state.rooms.size() > MAX_ROOMS) {
+            RoomRecord oldest = state.rooms.values().stream()
+                    .min(Comparator.comparingLong(value -> value.lastJoinedAt))
+                    .orElse(null);
+            if (oldest == null) {
+                return;
+            }
+            state.rooms.remove(oldest.key);
+            for (String mediaId : mediaIds(oldest.events)) {
+                deleteEncryptedMedia(mediaId);
+            }
+        }
+    }
+
+    private void cleanupOrphanedMedia() {
+        Set<String> used = new HashSet<>();
+        for (RoomRecord room : state.rooms.values()) {
+            used.addAll(mediaIds(room.events));
+        }
+        File[] files = mediaDirectory.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            String name = file.getName();
+            if (
+                    file.isFile() &&
+                    name.endsWith(".enc") &&
+                    !used.contains(name.substring(0, name.length() - 4))
+            ) {
                 file.delete();
             }
         }
     }
 
+    private void ensureDirectories() throws IOException {
+        if (!rootDirectory.isDirectory() && !rootDirectory.mkdirs()) {
+            throw new IOException("Yerel kayıt klasörü oluşturulamadı.");
+        }
+        if (!mediaDirectory.isDirectory() && !mediaDirectory.mkdirs()) {
+            throw new IOException("Yerel medya klasörü oluşturulamadı.");
+        }
+    }
+
+    private void resetStoredData() {
+        stateFile.delete();
+        clearDirectory(mediaDirectory);
+        mediaDirectory.mkdirs();
+    }
+
     private void deleteEncryptedMedia(String mediaId) {
-        if (mediaId != null) {
+        if (validHex(mediaId, 32)) {
             new File(mediaDirectory, mediaId + ".enc").delete();
         }
     }
 
     private static List<String> mediaIds(List<StoredEvent> events) {
-        List<String> ids = new ArrayList<>();
+        List<String> result = new ArrayList<>();
         for (StoredEvent event : events) {
             if (event.mediaId != null) {
-                ids.add(event.mediaId);
+                result.add(event.mediaId);
             }
         }
-        return ids;
+        return result;
     }
 
     private static byte[] readBounded(File file, long limit) throws IOException {
         long length = file.length();
         if (length <= 0 || length > limit || length > Integer.MAX_VALUE) {
-            throw new IOException("Yerel veri boyutu geçersiz.");
+            throw new IOException("Yerel kayıt boyutu geçersiz.");
         }
-        byte[] data = new byte[(int) length];
+        byte[] bytes = new byte[(int) length];
         try (FileInputStream input = new FileInputStream(file)) {
-            readFully(input, data);
+            int offset = 0;
+            while (offset < bytes.length) {
+                int read = input.read(bytes, offset, bytes.length - offset);
+                if (read == -1) {
+                    throw new IOException("Yerel kayıt eksik.");
+                }
+                offset += read;
+            }
             if (input.read() != -1) {
-                Arrays.fill(data, (byte) 0);
-                throw new IOException("Yerel veri değişti.");
+                throw new IOException("Yerel kayıt boyutu değişti.");
             }
         }
-        return data;
-    }
-
-    private static void readFully(FileInputStream input, byte[] target) throws IOException {
-        int offset = 0;
-        while (offset < target.length) {
-            int read = input.read(target, offset, target.length - offset);
-            if (read == -1) {
-                throw new IOException("Dosya beklenenden kısa.");
-            }
-            offset += read;
-        }
+        return bytes;
     }
 
     private static void moveReplacing(File source, File destination) throws IOException {
@@ -638,36 +666,45 @@ final class LocalStore {
 
     private static String roomKey(String server, String roomName)
             throws GeneralSecurityException {
+        String normalizedServer = server.trim().toLowerCase(Locale.ROOT);
         String normalizedRoom = Normalizer.normalize(roomName.trim(), Normalizer.Form.NFKC)
                 .toLowerCase(Locale.ROOT);
-        String normalizedServer = server.trim().toLowerCase(Locale.ROOT);
-        byte[] digest = MessageDigest.getInstance("SHA-256").digest(
-                (normalizedServer + "\n" + normalizedRoom).getBytes(StandardCharsets.UTF_8)
-        );
-        String result = CryptoBox.toHex(digest);
-        Arrays.fill(digest, (byte) 0);
-        return result;
+        byte[] digest = MessageDigest.getInstance("SHA-256")
+                .digest((normalizedServer + "\n" + normalizedRoom).getBytes(StandardCharsets.UTF_8));
+        return CryptoBox.toHex(digest);
+    }
+
+    private static boolean validHex(String value, int length) {
+        return value != null && value.matches("^[a-f0-9]{" + length + "}$");
     }
 
     private static String extensionFor(String mimeType) {
-        switch (mimeType) {
-            case "image/jpeg":
-                return ".jpg";
-            case "image/png":
-                return ".png";
-            case "image/webp":
-                return ".webp";
-            case "image/gif":
-                return ".gif";
-            case "video/mp4":
-                return ".mp4";
-            case "video/webm":
-                return ".webm";
-            case "video/3gpp":
-                return ".3gp";
-            default:
-                return mimeType.startsWith("image/") ? ".image" : ".video";
+        if ("image/jpeg".equals(mimeType)) {
+            return ".jpg";
         }
+        if ("image/png".equals(mimeType)) {
+            return ".png";
+        }
+        if ("image/webp".equals(mimeType)) {
+            return ".webp";
+        }
+        if ("video/mp4".equals(mimeType)) {
+            return ".mp4";
+        }
+        return mimeType != null && mimeType.startsWith("image/") ? ".image" : ".video";
+    }
+
+    private static void clearDirectory(File directory) {
+        File[] files = directory.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    clearDirectory(file);
+                }
+                file.delete();
+            }
+        }
+        directory.delete();
     }
 
     static final class SavedRoom {
@@ -745,46 +782,61 @@ final class LocalStore {
     private static final class State {
         final Map<String, RoomRecord> rooms = new LinkedHashMap<>();
         String clientId = UUID.randomUUID().toString().replace("-", "");
-        boolean dirty = true;
+        boolean dirty;
 
-        JSONObject toJson() throws JSONException {
-            JSONObject root = new JSONObject();
-            root.put("v", 1);
-            root.put("client", clientId);
+        JSONObject toJson() {
+            JSONObject object = new JSONObject();
             JSONArray roomArray = new JSONArray();
-            for (RoomRecord room : rooms.values()) {
-                roomArray.put(room.toJson());
+            try {
+                object.put("v", 1);
+                object.put("client", clientId);
+                for (RoomRecord room : rooms.values()) {
+                    roomArray.put(room.toJson());
+                }
+                object.put("rooms", roomArray);
+            } catch (JSONException exception) {
+                throw new IllegalStateException(exception);
             }
-            root.put("rooms", roomArray);
-            return root;
+            return object;
         }
 
-        static State fromJson(JSONObject root) throws JSONException {
-            if (root.optInt("v", 0) != 1) {
-                throw new JSONException("Yerel veri sürümü desteklenmiyor.");
+        static State fromJson(JSONObject object) throws JSONException {
+            State result = new State();
+            String storedClient = object.optString(
+                    "client",
+                    object.optString("clientId", "")
+            );
+            if (validHex(storedClient, 32)) {
+                result.clientId = storedClient;
+            } else {
+                result.dirty = true;
             }
-            State state = new State();
-            String savedClientId = clean(root.optString("client", ""), 32);
-            if (validHex(savedClientId, 32)) {
-                state.clientId = savedClientId;
-                state.dirty = false;
-            }
-            JSONArray roomArray = root.optJSONArray("rooms");
+            JSONArray roomArray = object.optJSONArray("rooms");
             if (roomArray == null) {
-                return state;
+                result.dirty = true;
+                return result;
             }
-            for (int index = 0; index < roomArray.length() && state.rooms.size() < MAX_ROOMS; index++) {
-                RoomRecord room = RoomRecord.fromJson(roomArray.optJSONObject(index));
-                if (room != null) {
-                    state.rooms.put(room.key, room);
+            for (int index = 0; index < roomArray.length(); index++) {
+                JSONObject roomObject = roomArray.optJSONObject(index);
+                if (roomObject == null) {
+                    result.dirty = true;
+                    continue;
+                }
+                try {
+                    RoomRecord room = RoomRecord.fromJson(roomObject);
+                    result.rooms.put(room.key, room);
+                    result.dirty |= room.dirty;
+                } catch (JSONException | IllegalArgumentException exception) {
+                    result.dirty = true;
                 }
             }
-            return state;
+            return result;
         }
     }
 
     private static final class RoomRecord {
         final String key;
+        final List<StoredEvent> events = new ArrayList<>();
         String server;
         String room;
         String displayName;
@@ -793,7 +845,7 @@ final class LocalStore {
         long retentionMs;
         long lastJoinedAt;
         long historyStartedAt;
-        final List<StoredEvent> events = new ArrayList<>();
+        boolean dirty;
 
         RoomRecord(
                 String key,
@@ -817,16 +869,21 @@ final class LocalStore {
             this.historyStartedAt = historyStartedAt;
         }
 
+        boolean hasNotificationAccess() {
+            return server != null &&
+                    server.startsWith("wss://") &&
+                    validHex(roomId, 64) &&
+                    validHex(authProof, 64);
+        }
+
         JSONObject toJson() throws JSONException {
             JSONObject object = new JSONObject();
             object.put("key", key);
             object.put("server", server);
             object.put("room", room);
             object.put("name", displayName);
-            if (hasNotificationAccess()) {
-                object.put("roomId", roomId);
-                object.put("proof", authProof);
-            }
+            object.put("roomId", roomId);
+            object.put("proof", authProof);
             object.put("retention", retentionMs);
             object.put("joined", lastJoinedAt);
             object.put("started", historyStartedAt);
@@ -838,41 +895,44 @@ final class LocalStore {
             return object;
         }
 
-        static RoomRecord fromJson(JSONObject object) {
-            if (object == null) {
-                return null;
-            }
-            String key = clean(object.optString("key", ""), 64);
-            String server = clean(object.optString("server", ""), 300);
-            String roomName = clean(object.optString("room", ""), 64);
-            String name = clean(object.optString("name", ""), 24);
-            String roomId = clean(object.optString("roomId", ""), 64);
-            String authProof = clean(object.optString("proof", ""), 64);
-            if (!validHex(roomId, 64) || !validHex(authProof, 64)) {
-                roomId = null;
-                authProof = null;
-            }
-            long retention = object.optLong("retention", 0);
-            long joined = object.optLong("joined", 0);
-            long started = object.optLong("started", 0);
+        static RoomRecord fromJson(JSONObject object) throws JSONException {
+            String key = object.getString("key");
+            String server = object.getString("server");
+            String roomName = object.getString("room");
+            String displayName = object.optString(
+                    "displayName",
+                    object.optString("name", object.optString("display", ""))
+            );
+            String roomId = object.optString("roomId", object.optString("id", ""));
+            String proof = object.optString("proof", object.optString("authProof", ""));
+            long retention = object.optLong(
+                    "retentionMs",
+                    object.optLong("retention", RetentionPolicy.DEFAULT_MS)
+            );
+            long joined = object.optLong(
+                    "joined",
+                    object.optLong("lastJoinedAt", System.currentTimeMillis())
+            );
+            long started = object.optLong(
+                    "started",
+                    object.optLong("historyStartedAt", 0)
+            );
             if (
-                    !key.matches("^[a-f0-9]{64}$") ||
+                    !validHex(key, 64) ||
                     server.isEmpty() ||
                     roomName.isEmpty() ||
-                    name.isEmpty() ||
-                    !RetentionPolicy.isSupported(retention) ||
-                    joined <= 0 ||
-                    started < 0
+                    displayName.isEmpty() ||
+                    !RetentionPolicy.isSupported(retention)
             ) {
-                return null;
+                throw new IllegalArgumentException("Kayıtlı oda geçersiz.");
             }
-            RoomRecord room = new RoomRecord(
+            RoomRecord result = new RoomRecord(
                     key,
                     server,
                     roomName,
-                    name,
+                    displayName,
                     roomId,
-                    authProof,
+                    proof,
                     retention,
                     joined,
                     started
@@ -881,84 +941,81 @@ final class LocalStore {
             if (eventArray != null) {
                 int start = Math.max(0, eventArray.length() - MAX_EVENTS);
                 for (int index = start; index < eventArray.length(); index++) {
-                    StoredEvent event = StoredEvent.fromJson(eventArray.optJSONObject(index));
-                    if (event != null) {
-                        room.events.add(event);
+                    JSONObject eventObject = eventArray.optJSONObject(index);
+                    if (eventObject == null) {
+                        result.dirty = true;
+                        continue;
+                    }
+                    try {
+                        result.events.add(StoredEvent.fromJson(eventObject));
+                    } catch (JSONException | IllegalArgumentException exception) {
+                        result.dirty = true;
                     }
                 }
             }
-            return room;
-        }
-
-        boolean hasNotificationAccess() {
-            return validHex(roomId, 64) && validHex(authProof, 64);
+            return result;
         }
     }
 
     private static final class StoredEvent {
-        final long id;
-        final int type;
-        final String sender;
-        final String text;
-        final long sentAt;
-        final boolean own;
-        final String mimeType;
-        final String displayName;
-        final long size;
-        final String mediaId;
-
-        StoredEvent(
-                long id,
-                int type,
-                String sender,
-                String text,
-                long sentAt,
-                boolean own,
-                String mimeType,
-                String displayName,
-                long size,
-                String mediaId
-        ) {
-            this.id = id;
-            this.type = type;
-            this.sender = sender;
-            this.text = text;
-            this.sentAt = sentAt;
-            this.own = own;
-            this.mimeType = mimeType;
-            this.displayName = displayName;
-            this.size = size;
-            this.mediaId = mediaId;
-        }
+        long id;
+        int type;
+        String messageId;
+        String sender;
+        String text;
+        long sentAt;
+        boolean own;
+        String mediaId;
+        String mimeType;
+        String displayName;
+        long size;
+        String replyMessageId;
+        String replySender;
+        String replyPreview;
+        int deliveryStatus;
 
         static StoredEvent text(ChatEvent event) {
-            return new StoredEvent(
-                    event.id,
-                    event.type,
-                    event.sender,
-                    event.text,
-                    event.sentAt,
-                    event.own,
-                    null,
-                    null,
-                    0,
-                    null
-            );
+            StoredEvent stored = common(event);
+            stored.type = ChatEvent.TYPE_TEXT;
+            stored.text = event.text;
+            return stored;
         }
 
         static StoredEvent media(ChatEvent event, String mediaId) {
-            return new StoredEvent(
-                    event.id,
-                    event.type,
-                    event.sender,
-                    null,
-                    event.sentAt,
-                    event.own,
-                    event.mimeType,
-                    event.displayName,
-                    event.size,
-                    mediaId
-            );
+            StoredEvent stored = common(event);
+            stored.type = ChatEvent.TYPE_MEDIA;
+            stored.mediaId = mediaId;
+            stored.mimeType = event.mimeType;
+            stored.displayName = event.displayName;
+            stored.size = event.size;
+            return stored;
+        }
+
+        private static StoredEvent common(ChatEvent event) {
+            StoredEvent stored = new StoredEvent();
+            stored.id = event.id;
+            stored.messageId = event.messageId;
+            stored.sender = event.sender;
+            stored.sentAt = event.sentAt;
+            stored.own = event.own;
+            stored.replyMessageId = event.replyMessageId;
+            stored.replySender = event.replySender;
+            stored.replyPreview = event.replyPreview;
+            stored.deliveryStatus = event.deliveryStatus;
+            return stored;
+        }
+
+        ChatEvent.Reply reply() {
+            if (
+                    !validHex(replyMessageId, 32) ||
+                    replySender == null ||
+                    replySender.isEmpty() ||
+                    replyPreview == null ||
+                    replyPreview.isEmpty()
+            ) {
+                return null;
+            }
+            return new ChatEvent.Reply(replyMessageId, replySender, replyPreview);
         }
 
         JSONObject toJson() throws JSONException {
@@ -968,75 +1025,78 @@ final class LocalStore {
             object.put("sender", sender);
             object.put("sentAt", sentAt);
             object.put("own", own);
+            if (messageId != null) {
+                object.put("mid", messageId);
+            }
+            if (replyMessageId != null) {
+                object.put("replyId", replyMessageId);
+                object.put("replySender", replySender);
+                object.put("replyPreview", replyPreview);
+            }
+            if (deliveryStatus != ChatEvent.STATUS_NONE) {
+                object.put("status", deliveryStatus);
+            }
             if (type == ChatEvent.TYPE_TEXT) {
                 object.put("text", text);
             } else {
+                object.put("media", mediaId);
                 object.put("mime", mimeType);
                 object.put("name", displayName);
                 object.put("size", size);
-                object.put("media", mediaId);
             }
             return object;
         }
 
-        static StoredEvent fromJson(JSONObject object) {
-            if (object == null) {
-                return null;
-            }
-            long id = object.optLong("id", 0);
-            int type = object.optInt("type", 0);
-            String sender = clean(object.optString("sender", ""), 24);
-            long sentAt = object.optLong("sentAt", 0);
-            boolean own = object.optBoolean("own", false);
-            if (id <= 0 || sender.isEmpty() || sentAt <= 0) {
-                return null;
-            }
-            if (type == ChatEvent.TYPE_TEXT) {
-                String text = bounded(object.optString("text", ""), 2_000);
-                if (text.trim().isEmpty()) {
-                    return null;
-                }
-                return new StoredEvent(id, type, sender, text, sentAt, own, null, null, 0, null);
-            }
-            if (type != ChatEvent.TYPE_MEDIA) {
-                return null;
-            }
-            String mime = clean(object.optString("mime", ""), 80).toLowerCase(Locale.ROOT);
-            String name = clean(object.optString("name", ""), 120);
-            String mediaId = clean(object.optString("media", ""), 32);
-            long size = object.optLong("size", 0);
-            long mediaLimit = mime.startsWith("image/")
-                    ? CryptoBox.MAX_IMAGE_BYTES
-                    : CryptoBox.MAX_VIDEO_BYTES;
+        static StoredEvent fromJson(JSONObject object) throws JSONException {
+            StoredEvent stored = new StoredEvent();
+            stored.id = object.getLong("id");
+            stored.type = object.getInt("type");
+            stored.sender = object.getString("sender");
+            stored.sentAt = object.optLong("sentAt", object.optLong("sent", 0));
+            stored.own = object.optBoolean("own", false);
+            stored.messageId = object.optString("mid", null);
+            stored.replyMessageId = object.optString("replyId", null);
+            stored.replySender = object.optString("replySender", null);
+            stored.replyPreview = object.optString("replyPreview", null);
+            stored.deliveryStatus = object.optInt("status", ChatEvent.STATUS_NONE);
             if (
-                    (!mime.startsWith("image/") && !mime.startsWith("video/")) ||
-                    name.isEmpty() ||
-                    !mediaId.matches("^[a-f0-9]{32}$") ||
-                    size <= 0 ||
-                    size > mediaLimit
+                    stored.id <= 0 ||
+                    stored.sender.isEmpty() ||
+                    stored.sender.length() > 24 ||
+                    stored.sentAt <= 0 ||
+                    (stored.messageId != null && !validHex(stored.messageId, 32)) ||
+                    stored.deliveryStatus < ChatEvent.STATUS_NONE ||
+                    stored.deliveryStatus > ChatEvent.STATUS_SEEN
             ) {
-                return null;
+                throw new IllegalArgumentException("Kayıtlı ileti geçersiz.");
             }
-            return new StoredEvent(id, type, sender, null, sentAt, own, mime, name, size, mediaId);
+            if (stored.type == ChatEvent.TYPE_TEXT) {
+                stored.text = object.getString("text");
+                if (stored.text.isEmpty() || stored.text.length() > 2_000) {
+                    throw new IllegalArgumentException("Kayıtlı metin geçersiz.");
+                }
+                return stored;
+            }
+            if (stored.type != ChatEvent.TYPE_MEDIA) {
+                throw new IllegalArgumentException("Kayıtlı ileti türü geçersiz.");
+            }
+            stored.mediaId = object.optString("media", object.optString("mediaId", ""));
+            stored.mimeType = object.optString("mime", object.optString("mimeType", ""));
+            stored.displayName = object.optString(
+                    "name",
+                    object.optString("displayName", "")
+            );
+            stored.size = object.getLong("size");
+            if (
+                    !validHex(stored.mediaId, 32) ||
+                    (!stored.mimeType.startsWith("image/") &&
+                            !stored.mimeType.startsWith("video/")) ||
+                    stored.displayName.isEmpty() ||
+                    stored.size <= 0
+            ) {
+                throw new IllegalArgumentException("Kayıtlı medya geçersiz.");
+            }
+            return stored;
         }
-    }
-
-    private static String clean(String value, int maxLength) {
-        if (value == null) {
-            return "";
-        }
-        String cleaned = value.replaceAll("[\\p{Cntrl}]", " ").trim();
-        return cleaned.length() <= maxLength ? cleaned : cleaned.substring(0, maxLength);
-    }
-
-    private static boolean validHex(String value, int length) {
-        return value != null && value.matches("^[a-f0-9]{" + length + "}$");
-    }
-
-    private static String bounded(String value, int maxLength) {
-        if (value == null) {
-            return "";
-        }
-        return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 }

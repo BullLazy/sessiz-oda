@@ -41,8 +41,22 @@
     <string name="action_leave">Çık</string>
     <string name="hint_message">Mesaj yaz…</string>
     <string name="action_send">Gönder</string>
+    <string name="action_reply">Yanıtla</string>
+    <string name="action_copy">Kopyala</string>
+    <string name="action_download">İndir</string>
+    <string name="action_cancel_reply">Yanıtı iptal et</string>
+    <string name="reply_quote">%1$s\n%2$s</string>
+    <string name="reply_cancel_symbol" translatable="false">×</string>
+    <string name="reply_unavailable">Bu eski ileti yanıtlanamıyor.</string>
+    <string name="reply_original_unavailable">Yanıtlanan ileti artık geçmişte değil.</string>
     <string name="action_media">Görsel veya video seç</string>
     <string name="media_button_symbol" translatable="false">+</string>
+    <string name="media_send_mode_title">Nasıl gönderilsin?</string>
+    <string name="media_send_normal">Normal gönder</string>
+    <string name="media_send_view_once">Tek gösterimlik gönder</string>
+    <string name="media_downloaded">%1$s kaydedildi.</string>
+    <string name="media_download_failed">Medya kaydedilemedi.</string>
+    <string name="view_once_unavailable">Tek gösterimlik içerik artık açılamıyor.</string>
     <string name="clipboard_label">Sessiz Oda mesajı</string>
     <string name="message_copied">Mesaj kopyalandı.</string>
     <string name="message_copy_failed">Mesaj kopyalanamadı.</string>

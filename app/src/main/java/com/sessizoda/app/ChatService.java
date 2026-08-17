@@ -29,9 +29,11 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,6 +66,7 @@ public final class ChatService extends Service {
                 String displayName,
                 int presence,
                 boolean mediaSupported,
+                boolean advancedSupported,
                 long retentionMs
         );
 
@@ -91,6 +94,8 @@ public final class ChatService extends Service {
     private final AtomicBoolean mediaSending = new AtomicBoolean(false);
     private final List<ChatEvent> events = new ArrayList<>();
     private final Map<String, IncomingMedia> incomingMedia = new HashMap<>();
+    private final Set<String> ignoredIncomingMedia = new HashSet<>();
+    private final Map<String, ReceiptTracker> receiptTrackers = new HashMap<>();
     private final Map<String, RoomMonitorClient> monitorClients = new HashMap<>();
     private final Runnable historyExpiryRunnable = this::handleHistoryExpiry;
     private final Runnable monitorRetryRunnable = this::reloadNotificationMonitors;
@@ -101,6 +106,7 @@ public final class ChatService extends Service {
     private volatile CryptoBox cryptoBox;
     private volatile File sessionDirectory;
     private volatile String displayName = "";
+    private volatile String localClientId = "";
     private String roomName = "";
     private String roomKey = "";
     private String activeServer = "";
@@ -114,6 +120,7 @@ public final class ChatService extends Service {
     private volatile boolean connecting;
     private volatile boolean connected;
     private volatile boolean mediaSupported;
+    private volatile boolean advancedSupported;
     private int presence;
     private volatile int connectionGeneration;
     private long retentionMs = RetentionPolicy.DEFAULT_MS;
@@ -205,6 +212,7 @@ public final class ChatService extends Service {
             if (manager != null) {
                 manager.cancel(MESSAGE_NOTIFICATION_ID);
             }
+            sendPendingSeenReceipts();
         }
     }
 
@@ -212,18 +220,48 @@ public final class ChatService extends Service {
         return connected;
     }
 
-    boolean sendText(String message) {
+    boolean sendText(String message, ChatEvent.Reply reply) {
         ChatClient currentClient = chatClient;
         CryptoBox currentCrypto = cryptoBox;
-        if (!connected || currentClient == null || currentCrypto == null) {
+        String currentClientId = localClientId;
+        if (
+                !connected ||
+                currentClient == null ||
+                currentCrypto == null ||
+                currentClientId.isEmpty()
+        ) {
             emitError("Bağlantı açık değil.");
             return false;
         }
+        String messageId = UUID.randomUUID().toString().replace("-", "");
+        long sentAt = System.currentTimeMillis();
         try {
-            if (!currentClient.sendCipher("text", currentCrypto.encryptText(displayName, message))) {
+            String payload = currentCrypto.encryptText(
+                    messageId,
+                    currentClientId,
+                    displayName,
+                    message,
+                    sentAt,
+                    reply
+            );
+            if (!currentClient.sendCipher(
+                    "text",
+                    payload,
+                    advancedSupported ? messageId : null
+            )) {
                 emitError("Mesaj gönderilemedi.");
                 return false;
             }
+            addEvent(ChatEvent.text(
+                    nextEventId++,
+                    messageId,
+                    displayName,
+                    message,
+                    sentAt,
+                    true,
+                    reply,
+                    advancedSupported ? ChatEvent.STATUS_PENDING : ChatEvent.STATUS_NONE
+            ));
             return true;
         } catch (GeneralSecurityException exception) {
             emitError("Mesaj şifrelenemedi.");
@@ -231,7 +269,7 @@ public final class ChatService extends Service {
         }
     }
 
-    void sendMedia(Uri uri) {
+    boolean sendMedia(Uri uri, boolean viewOnce, ChatEvent.Reply reply) {
         if (!connected || !mediaSupported || !mediaSending.compareAndSet(false, true)) {
             if (!connected) {
                 emitError("Bağlantı açık değil.");
@@ -240,7 +278,12 @@ public final class ChatService extends Service {
             } else {
                 emitError("Bir medya zaten gönderiliyor.");
             }
-            return;
+            return false;
+        }
+        if (viewOnce && !advancedSupported) {
+            mediaSending.set(false);
+            emitError("Tek gösterimlik medya için Render sunucusunu v1.5 sürümüne güncelleyin.");
+            return false;
         }
 
         MediaMetadata metadata;
@@ -249,7 +292,7 @@ public final class ChatService extends Service {
         } catch (IOException exception) {
             mediaSending.set(false);
             emitError("Seçilen dosya okunamadı.");
-            return;
+            return false;
         }
         long limit = metadata.mimeType.startsWith("image/")
                 ? CryptoBox.MAX_IMAGE_BYTES
@@ -259,12 +302,50 @@ public final class ChatService extends Service {
             emitError(metadata.mimeType.startsWith("image/")
                     ? "Görsel en fazla 100 MB olabilir."
                     : "Video en fazla 500 MB olabilir.");
-            return;
+            return false;
         }
 
         emitTransfer("Medya hazırlanıyor…", true);
         int generation = connectionGeneration;
-        mediaExecutor.execute(() -> transferMedia(uri, metadata, generation));
+        mediaExecutor.execute(() -> transferMedia(
+                uri,
+                metadata,
+                generation,
+                viewOnce,
+                reply
+        ));
+        return true;
+    }
+
+    boolean claimViewOnce(String messageId) {
+        ChatEvent event = findEvent(messageId);
+        if (
+                event == null ||
+                event.own ||
+                event.type != ChatEvent.TYPE_MEDIA ||
+                !event.viewOnce ||
+                event.viewOnceConsumed ||
+                event.mediaFile == null ||
+                !event.mediaFile.isFile()
+        ) {
+            return false;
+        }
+        event.viewOnceConsumed = true;
+        sendReceipt(event, "seen");
+        notifyHistoryChanged();
+        return true;
+    }
+
+    void finishViewOnce(String messageId) {
+        ChatEvent event = findEvent(messageId);
+        if (
+                event != null &&
+                event.viewOnce &&
+                event.viewOnceConsumed &&
+                event.mediaFile != null
+        ) {
+            event.mediaFile.delete();
+        }
     }
 
     void leave() {
@@ -283,9 +364,11 @@ public final class ChatService extends Service {
         connecting = false;
         connected = false;
         mediaSupported = false;
+        advancedSupported = false;
         presence = 0;
         cryptoBox = null;
         displayName = "";
+        localClientId = "";
         roomName = "";
         roomKey = "";
         activeServer = "";
@@ -294,6 +377,7 @@ public final class ChatService extends Service {
         historyExpiresAt = 0;
         mediaSending.set(false);
         clearIncomingMedia();
+        receiptTrackers.clear();
         storageExecutor.execute(() -> clearDirectory(oldSessionDirectory));
         emitState();
         reloadNotificationMonitors();
@@ -312,6 +396,7 @@ public final class ChatService extends Service {
         events.clear();
         nextEventId = 1;
         clearIncomingMedia();
+        receiptTrackers.clear();
         int generation = ++connectionGeneration;
         historyCycle++;
         File newSessionDirectory = new File(
@@ -339,6 +424,7 @@ public final class ChatService extends Service {
             connecting = true;
             connected = false;
             mediaSupported = false;
+            advancedSupported = false;
             presence = 0;
             emitState();
 
@@ -359,6 +445,7 @@ public final class ChatService extends Service {
                             return;
                         }
                         roomKey = history.roomKey;
+                        localClientId = history.clientId;
                         historyExpiresAt = history.expiresAt;
                         replaceHistory(history.events);
                         openSocket(generation, server, roomId, proof, history.clientId);
@@ -387,7 +474,11 @@ public final class ChatService extends Service {
         try {
             chatClient = new ChatClient(server, roomId, proof, clientId, new ChatClient.Listener() {
                 @Override
-                public void onJoined(boolean supportsMedia, boolean supportsNotifications) {
+                public void onJoined(
+                        boolean supportsMedia,
+                        boolean supportsNotifications,
+                        boolean supportsAdvanced
+                ) {
                     mainHandler.post(() -> {
                         if (generation != connectionGeneration) {
                             return;
@@ -395,6 +486,7 @@ public final class ChatService extends Service {
                         connecting = false;
                         connected = true;
                         mediaSupported = supportsMedia;
+                        advancedSupported = supportsAdvanced;
                         updatePersistentNotification();
                         reloadNotificationMonitors();
                         scheduleHistoryExpiry();
@@ -409,6 +501,12 @@ public final class ChatService extends Service {
                             addSystemEvent(
                                     "Sunucu arka plan bildirimlerini desteklemiyor. Render " +
                                     "servisini son GitHub commit'iyle yeniden dağıtın."
+                            );
+                        }
+                        if (!supportsAdvanced) {
+                            addSystemEvent(
+                                    "Yanıtlama, tek gösterim ve teslim/görüldü bilgisi için " +
+                                    "Render servisini v1.5 sunucusuyla yeniden dağıtın."
                             );
                         }
                     });
@@ -427,6 +525,15 @@ public final class ChatService extends Service {
                 @Override
                 public void onCipher(String kind, String payload) {
                     handleCipher(generation, kind, payload);
+                }
+
+                @Override
+                public void onAccepted(String messageId, int recipients) {
+                    mainHandler.post(() -> {
+                        if (generation == connectionGeneration) {
+                            handleAccepted(messageId, recipients);
+                        }
+                    });
                 }
 
                 @Override
@@ -470,15 +577,29 @@ public final class ChatService extends Service {
                     if (!"text".equals(kind)) {
                         return;
                     }
+                    if (
+                            packet.deviceId != null &&
+                            packet.deviceId.equals(localClientId)
+                    ) {
+                        return;
+                    }
                     mainHandler.post(() -> {
                         if (generation == connectionGeneration) {
-                            addEvent(ChatEvent.text(
+                            boolean own =
+                                    packet.deviceId == null &&
+                                    packet.sender.equals(displayName);
+                            ChatEvent event = ChatEvent.text(
                                     nextEventId++,
+                                    packet.messageId,
                                     packet.sender,
                                     packet.text,
                                     packet.sentAt,
-                                    packet.sender.equals(displayName)
-                            ));
+                                    own,
+                                    packet.reply,
+                                    ChatEvent.STATUS_NONE
+                            );
+                            addEvent(event);
+                            sendReceivedReceipts(event);
                         }
                     });
                     break;
@@ -501,6 +622,16 @@ public final class ChatService extends Service {
                     }
                     receiveMediaEnd(generation, packet);
                     break;
+                case CryptoBox.DecryptedPacket.RECEIPT:
+                    if (!"receipt".equals(kind)) {
+                        return;
+                    }
+                    mainHandler.post(() -> {
+                        if (generation == connectionGeneration) {
+                            handleReceipt(packet);
+                        }
+                    });
+                    break;
                 default:
                     throw new GeneralSecurityException("Paket türü desteklenmiyor.");
             }
@@ -522,6 +653,10 @@ public final class ChatService extends Service {
         if (generation != connectionGeneration || sessionDirectory == null) {
             return;
         }
+        if (packet.deviceId != null && packet.deviceId.equals(localClientId)) {
+            ignoredIncomingMedia.add(packet.transferId);
+            return;
+        }
         pruneIncomingMedia();
         long limit = packet.mimeType.startsWith("image/")
                 ? CryptoBox.MAX_IMAGE_BYTES
@@ -540,6 +675,10 @@ public final class ChatService extends Service {
     private synchronized void receiveMediaChunk(int generation, CryptoBox.DecryptedPacket packet)
             throws IOException {
         if (generation != connectionGeneration) {
+            Arrays.fill(packet.data, (byte) 0);
+            return;
+        }
+        if (ignoredIncomingMedia.contains(packet.transferId)) {
             Arrays.fill(packet.data, (byte) 0);
             return;
         }
@@ -570,6 +709,9 @@ public final class ChatService extends Service {
         if (generation != connectionGeneration) {
             return;
         }
+        if (ignoredIncomingMedia.remove(packet.transferId)) {
+            return;
+        }
         IncomingMedia incoming = incomingMedia.remove(packet.transferId);
         if (incoming == null) {
             throw new IOException("Medya başlangıcı bulunamadı.");
@@ -597,44 +739,75 @@ public final class ChatService extends Service {
                 completedFile.delete();
                 return;
             }
-            addEvent(ChatEvent.media(
+            ChatEvent event = ChatEvent.media(
                     nextEventId++,
+                    incoming.messageId,
                     incoming.sender,
                     incoming.sentAt,
-                    incoming.sender.equals(displayName),
+                    false,
                     completedFile,
                     incoming.mimeType,
                     incoming.displayName,
-                    incoming.size
-            ));
+                    incoming.size,
+                    incoming.reply,
+                    incoming.viewOnce,
+                    false,
+                    ChatEvent.STATUS_NONE
+            );
+            addEvent(event);
+            sendReceivedReceipts(event);
         });
     }
 
-    private void transferMedia(Uri uri, MediaMetadata metadata, int generation) {
+    private void transferMedia(
+            Uri uri,
+            MediaMetadata metadata,
+            int generation,
+            boolean viewOnce,
+            ChatEvent.Reply reply
+    ) {
         ChatClient currentClient = chatClient;
         CryptoBox currentCrypto = cryptoBox;
+        String currentClientId = localClientId;
         if (
                 generation != connectionGeneration ||
                 currentClient == null ||
                 currentCrypto == null ||
+                currentClientId.isEmpty() ||
                 !connected
         ) {
             finishTransferWithError(generation, "Bağlantı açık değil.");
             return;
         }
         String transferId = UUID.randomUUID().toString().replace("-", "");
+        long sentAt = System.currentTimeMillis();
         byte[] buffer = new byte[CryptoBox.MEDIA_CHUNK_BYTES];
+        File localPart = viewOnce || sessionDirectory == null
+                ? null
+                : new File(sessionDirectory, transferId + ".sending");
+        File completedFile = viewOnce || sessionDirectory == null
+                ? null
+                : new File(sessionDirectory, transferId + extensionFor(metadata.mimeType));
+        FileOutputStream localOutput = null;
+        boolean completed = false;
         try (InputStream input = getContentResolver().openInputStream(uri)) {
             if (input == null) {
                 throw new IOException("Dosya açılamadı.");
             }
+            if (localPart != null) {
+                localOutput = new FileOutputStream(localPart, false);
+            }
             if (!currentClient.sendMediaCipher("start", currentCrypto.encryptMediaStart(
                     transferId,
+                    currentClientId,
                     displayName,
                     metadata.mimeType,
                     metadata.displayName,
-                    metadata.size
-            ))) {
+                    metadata.size,
+                    sentAt,
+                    viewOnce,
+                    reply
+            ), advancedSupported ? transferId : null)) {
                 throw new IOException("Aktarım başlatılamadı.");
             }
 
@@ -644,17 +817,27 @@ public final class ChatService extends Service {
             int lastPercent = -1;
             int read;
             while ((read = input.read(buffer)) != -1) {
+                if (read == 0) {
+                    continue;
+                }
                 if (!connected || !waitForQueue(currentClient, generation)) {
                     throw new IOException("Bağlantı kesildi.");
                 }
                 digest.update(buffer, 0, read);
+                if (localOutput != null) {
+                    localOutput.write(buffer, 0, read);
+                }
                 String encryptedChunk = currentCrypto.encryptMediaChunk(
                         transferId,
                         chunkIndex,
                         buffer,
                         read
                 );
-                if (!currentClient.sendMediaCipher("chunk", encryptedChunk)) {
+                if (!currentClient.sendMediaCipher(
+                        "chunk",
+                        encryptedChunk,
+                        advancedSupported ? transferId : null
+                )) {
                     throw new IOException("Medya parçası gönderilemedi.");
                 }
                 sentBytes += read;
@@ -674,20 +857,71 @@ public final class ChatService extends Service {
                             transferId,
                             chunkIndex,
                             CryptoBox.toHex(digest.digest())
-                    )
+                    ),
+                    advancedSupported ? transferId : null
             )) {
                 throw new IOException("Aktarım tamamlanamadı.");
             }
+            if (localOutput != null) {
+                localOutput.flush();
+                localOutput.getFD().sync();
+                localOutput.close();
+                localOutput = null;
+                if (!localPart.renameTo(completedFile)) {
+                    throw new IOException("Yerel medya tamamlanamadı.");
+                }
+            }
             if (generation == connectionGeneration) {
+                File eventFile = completedFile;
+                mainHandler.post(() -> {
+                    if (generation != connectionGeneration) {
+                        if (eventFile != null) {
+                            eventFile.delete();
+                        }
+                        return;
+                    }
+                    addEvent(ChatEvent.media(
+                            nextEventId++,
+                            transferId,
+                            displayName,
+                            sentAt,
+                            true,
+                            eventFile,
+                            metadata.mimeType,
+                            metadata.displayName,
+                            metadata.size,
+                            reply,
+                            viewOnce,
+                            viewOnce,
+                            advancedSupported
+                                    ? ChatEvent.STATUS_PENDING
+                                    : ChatEvent.STATUS_NONE
+                    ));
+                });
                 mediaSending.set(false);
                 emitTransfer("Medya gönderildi", false);
             }
+            completed = true;
         } catch (IOException | GeneralSecurityException exception) {
             finishTransferWithError(
                     generation,
                     "Medya gönderilemedi. Bağlantıyı ve dosyayı kontrol edin."
             );
         } finally {
+            if (localOutput != null) {
+                try {
+                    localOutput.close();
+                } catch (IOException ignored) {
+                }
+            }
+            if (!completed) {
+                if (localPart != null) {
+                    localPart.delete();
+                }
+                if (completedFile != null) {
+                    completedFile.delete();
+                }
+            }
             Arrays.fill(buffer, (byte) 0);
         }
     }
@@ -759,6 +993,166 @@ public final class ChatService extends Service {
         return new MediaMetadata(mimeType, displayName, size);
     }
 
+    private void handleAccepted(String messageId, int recipients) {
+        ReceiptTracker tracker = receiptTrackers.computeIfAbsent(
+                messageId,
+                ignored -> new ReceiptTracker()
+        );
+        tracker.expectedRecipients = recipients;
+        ChatEvent event = findEvent(messageId);
+        if (event != null && event.own) {
+            applyReceiptTracker(event, tracker);
+        }
+    }
+
+    private void handleReceipt(CryptoBox.DecryptedPacket packet) {
+        if (packet.deviceId == null || packet.deviceId.equals(localClientId)) {
+            return;
+        }
+        ChatEvent event = findEvent(packet.messageId);
+        ReceiptTracker tracker = receiptTrackers.get(packet.messageId);
+        if (tracker == null) {
+            if (event == null || !event.own) {
+                return;
+            }
+            tracker = new ReceiptTracker();
+            receiptTrackers.put(packet.messageId, tracker);
+        }
+        tracker.deliveredBy.add(packet.deviceId);
+        if ("seen".equals(packet.receiptState)) {
+            tracker.seenBy.add(packet.deviceId);
+        }
+        if (event != null && event.own) {
+            applyReceiptTracker(event, tracker);
+        }
+    }
+
+    private void applyReceiptTracker(ChatEvent event, ReceiptTracker tracker) {
+        int updatedStatus = event.deliveryStatus;
+        event.expectedRecipients = tracker.expectedRecipients;
+        event.deliveredBy.addAll(tracker.deliveredBy);
+        event.seenBy.addAll(tracker.seenBy);
+        if (tracker.expectedRecipients >= 0) {
+            updatedStatus = Math.max(updatedStatus, ChatEvent.STATUS_SENT);
+        }
+        if (
+                tracker.expectedRecipients > 0 &&
+                tracker.deliveredBy.size() >= tracker.expectedRecipients
+        ) {
+            updatedStatus = Math.max(updatedStatus, ChatEvent.STATUS_DELIVERED);
+        }
+        if (
+                tracker.expectedRecipients > 0 &&
+                tracker.seenBy.size() >= tracker.expectedRecipients
+        ) {
+            updatedStatus = ChatEvent.STATUS_SEEN;
+        }
+        if (updatedStatus == event.deliveryStatus) {
+            return;
+        }
+        event.deliveryStatus = updatedStatus;
+        persistDeliveryStatus(event);
+        notifyHistoryChanged();
+    }
+
+    private void sendReceivedReceipts(ChatEvent event) {
+        if (
+                event == null ||
+                event.own ||
+                event.messageId == null ||
+                !advancedSupported
+        ) {
+            return;
+        }
+        sendReceipt(event, "delivered");
+        if (appVisible && !event.viewOnce) {
+            sendReceipt(event, "seen");
+        }
+    }
+
+    private void sendPendingSeenReceipts() {
+        if (!connected || !advancedSupported) {
+            return;
+        }
+        for (ChatEvent event : new ArrayList<>(events)) {
+            if (
+                    !event.own &&
+                    event.messageId != null &&
+                    !event.readReceiptSent &&
+                    (!event.viewOnce || event.viewOnceConsumed)
+            ) {
+                sendReceipt(event, "seen");
+            }
+        }
+    }
+
+    private void sendReceipt(ChatEvent event, String state) {
+        ChatClient currentClient = chatClient;
+        CryptoBox currentCrypto = cryptoBox;
+        if (
+                !connected ||
+                !advancedSupported ||
+                currentClient == null ||
+                currentCrypto == null ||
+                event.messageId == null ||
+                localClientId.isEmpty()
+        ) {
+            return;
+        }
+        try {
+            boolean sent = currentClient.sendReceiptCipher(currentCrypto.encryptReceipt(
+                    event.messageId,
+                    localClientId,
+                    state
+            ));
+            if (sent && "seen".equals(state)) {
+                event.readReceiptSent = true;
+            }
+        } catch (GeneralSecurityException ignored) {
+        }
+    }
+
+    private ChatEvent findEvent(String messageId) {
+        if (messageId == null) {
+            return null;
+        }
+        for (ChatEvent event : events) {
+            if (messageId.equals(event.messageId)) {
+                return event;
+            }
+        }
+        return null;
+    }
+
+    private void persistDeliveryStatus(ChatEvent event) {
+        if (
+                event.messageId == null ||
+                event.viewOnce ||
+                roomKey.isEmpty() ||
+                event.deliveryStatus < ChatEvent.STATUS_SENT
+        ) {
+            return;
+        }
+        String activeRoomKey = roomKey;
+        String messageId = event.messageId;
+        int status = event.deliveryStatus;
+        int generation = connectionGeneration;
+        storageExecutor.execute(() -> {
+            try {
+                localStore.updateEventStatus(activeRoomKey, messageId, status);
+            } catch (IOException | GeneralSecurityException exception) {
+                emitStoreWarning(generation);
+            }
+        });
+    }
+
+    private void notifyHistoryChanged() {
+        Listener currentListener = listener;
+        if (currentListener != null) {
+            currentListener.onHistoryReset(new ArrayList<>(events));
+        }
+    }
+
     private void addEvent(ChatEvent event) {
         if (event.type != ChatEvent.TYPE_SYSTEM) {
             expireHistoryIfNeeded();
@@ -770,6 +1164,9 @@ public final class ChatService extends Service {
         ChatEvent removed = null;
         if (events.size() >= MAX_EVENTS) {
             removed = events.remove(0);
+            if (removed.messageId != null) {
+                receiptTrackers.remove(removed.messageId);
+            }
         }
         events.add(event);
         Listener currentListener = listener;
@@ -779,11 +1176,21 @@ public final class ChatService extends Service {
         if (!appVisible && !event.own && event.type != ChatEvent.TYPE_SYSTEM) {
             showMessageNotification();
         }
+        if (event.own && event.messageId != null) {
+            ReceiptTracker tracker = receiptTrackers.get(event.messageId);
+            if (tracker != null) {
+                applyReceiptTracker(event, tracker);
+            }
+        }
         ChatEvent removedEvent = removed;
         String activeRoomKey = roomKey;
         int generation = connectionGeneration;
         long eventHistoryCycle = historyCycle;
-        if (event.type != ChatEvent.TYPE_SYSTEM && !activeRoomKey.isEmpty()) {
+        if (
+                event.type != ChatEvent.TYPE_SYSTEM &&
+                !event.viewOnce &&
+                !activeRoomKey.isEmpty()
+        ) {
             storageExecutor.execute(() -> {
                 try {
                     long expiresAt = localStore.appendEvent(activeRoomKey, event);
@@ -851,6 +1258,7 @@ public final class ChatService extends Service {
         int generation = connectionGeneration;
         List<ChatEvent> expiredEvents = new ArrayList<>(events);
         events.clear();
+        receiptTrackers.clear();
         historyExpiresAt = 0;
         Listener currentListener = listener;
         if (currentListener != null) {
@@ -911,9 +1319,11 @@ public final class ChatService extends Service {
         connecting = false;
         connected = false;
         mediaSupported = false;
+        advancedSupported = false;
         presence = 0;
         chatClient = null;
         cryptoBox = null;
+        localClientId = "";
         activeServer = "";
         activeRoomId = "";
         mediaSending.set(false);
@@ -939,7 +1349,9 @@ public final class ChatService extends Service {
         connecting = false;
         connected = false;
         mediaSupported = false;
+        advancedSupported = false;
         cryptoBox = null;
+        localClientId = "";
         activeServer = "";
         activeRoomId = "";
         historyExpiresAt = 0;
@@ -959,6 +1371,7 @@ public final class ChatService extends Service {
                     displayName,
                     presence,
                     mediaSupported,
+                    advancedSupported,
                     retentionMs
             );
         }
@@ -1014,6 +1427,7 @@ public final class ChatService extends Service {
             incoming.abort();
         }
         incomingMedia.clear();
+        ignoredIncomingMedia.clear();
     }
 
     private void reloadNotificationMonitors() {
@@ -1349,6 +1763,7 @@ public final class ChatService extends Service {
         }
         mediaExecutor.shutdownNow();
         clearIncomingMedia();
+        receiptTrackers.clear();
         File oldSessionDirectory = sessionDirectory;
         sessionDirectory = null;
         events.clear();
@@ -1357,6 +1772,12 @@ public final class ChatService extends Service {
         cryptoBox = null;
         listener = null;
         super.onDestroy();
+    }
+
+    private static final class ReceiptTracker {
+        final Set<String> deliveredBy = new HashSet<>();
+        final Set<String> seenBy = new HashSet<>();
+        int expectedRecipients = -1;
     }
 
     private static final class MediaMetadata {
@@ -1372,12 +1793,15 @@ public final class ChatService extends Service {
     }
 
     private static final class IncomingMedia {
+        final String messageId;
         final String sender;
         final String mimeType;
         final String displayName;
         final long size;
         final long sentAt;
         final long createdAt;
+        final ChatEvent.Reply reply;
+        final boolean viewOnce;
         final File partialFile;
         final FileOutputStream output;
         final MessageDigest digest;
@@ -1385,12 +1809,15 @@ public final class ChatService extends Service {
         int nextIndex;
 
         IncomingMedia(CryptoBox.DecryptedPacket packet, File partialFile) throws IOException {
+            this.messageId = packet.messageId;
             this.sender = packet.sender;
             this.mimeType = packet.mimeType;
             this.displayName = packet.displayName;
             this.size = packet.size;
             this.sentAt = packet.sentAt;
             this.createdAt = System.currentTimeMillis();
+            this.reply = packet.reply;
+            this.viewOnce = packet.viewOnce;
             this.partialFile = partialFile;
             this.output = new FileOutputStream(partialFile, false);
             try {

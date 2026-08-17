@@ -2,6 +2,7 @@ package com.sessizoda.app;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipDescription;
@@ -46,16 +47,23 @@ import android.widget.Toast;
 import android.widget.VideoView;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     private static final int MAX_VISIBLE_MESSAGES = 150;
     private static final int REQUEST_MEDIA = 301;
     private static final int REQUEST_NOTIFICATIONS = 302;
+    private static final int REQUEST_SAVE_MEDIA = 303;
 
     private ScrollView loginScroll;
     private LinearLayout chatPanel;
@@ -75,6 +83,8 @@ public final class MainActivity extends Activity {
     private ScrollView messagesScroll;
     private View savedRoomsSection;
     private LinearLayout savedRoomsContainer;
+    private View replyPanel;
+    private TextView replyText;
 
     private ChatService chatService;
     private LocalStore localStore;
@@ -83,6 +93,7 @@ public final class MainActivity extends Activity {
     private boolean connected;
     private boolean connecting;
     private boolean mediaSupported;
+    private boolean advancedSupported;
     private boolean notificationPermissionAsked;
     private boolean hasNotificationRooms;
     private String displayName = "";
@@ -90,6 +101,14 @@ public final class MainActivity extends Activity {
     private long retentionMs = RetentionPolicy.DEFAULT_MS;
     private long lastRenderedEventId;
     private Uri pendingMediaUri;
+    private boolean pendingMediaViewOnce;
+    private ChatEvent.Reply pendingMediaReply;
+    private ChatEvent replyTarget;
+    private File pendingDownloadFile;
+    private String pendingDownloadMime;
+    private String pendingDownloadName;
+    private final Map<String, View> messageViews = new HashMap<>();
+    private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
 
     private final ChatService.Listener serviceListener = new ChatService.Listener() {
         @Override
@@ -100,6 +119,7 @@ public final class MainActivity extends Activity {
                 String sessionName,
                 int sessionPresence,
                 boolean sessionMediaSupported,
+                boolean sessionAdvancedSupported,
                 long sessionRetentionMs
         ) {
             runOnUiThread(() -> applySessionState(
@@ -109,6 +129,7 @@ public final class MainActivity extends Activity {
                     sessionName,
                     sessionPresence,
                     sessionMediaSupported,
+                    sessionAdvancedSupported,
                     sessionRetentionMs
             ));
         }
@@ -140,6 +161,7 @@ public final class MainActivity extends Activity {
                 connected = false;
                 connecting = false;
                 mediaSupported = false;
+                advancedSupported = false;
                 sendButton.setEnabled(false);
                 mediaButton.setEnabled(false);
                 connectionStatus.setText(R.string.status_disconnected);
@@ -174,8 +196,12 @@ public final class MainActivity extends Activity {
             chatService.setListener(serviceListener, lastRenderedEventId);
             if (pendingMediaUri != null && chatService.isConnected()) {
                 Uri uri = pendingMediaUri;
+                boolean viewOnce = pendingMediaViewOnce;
+                ChatEvent.Reply reply = pendingMediaReply;
                 pendingMediaUri = null;
-                chatService.sendMedia(uri);
+                pendingMediaViewOnce = false;
+                pendingMediaReply = null;
+                chatService.sendMedia(uri, viewOnce, reply);
             }
         }
 
@@ -186,6 +212,7 @@ public final class MainActivity extends Activity {
             connected = false;
             connecting = false;
             mediaSupported = false;
+            advancedSupported = false;
             sendButton.setEnabled(false);
             mediaButton.setEnabled(false);
         }
@@ -218,7 +245,10 @@ public final class MainActivity extends Activity {
         messagesScroll = findViewById(R.id.messages_scroll);
         savedRoomsSection = findViewById(R.id.saved_rooms_section);
         savedRoomsContainer = findViewById(R.id.saved_rooms_container);
+        replyPanel = findViewById(R.id.reply_panel);
+        replyText = findViewById(R.id.reply_text);
         Button leaveButton = findViewById(R.id.leave_button);
+        Button replyCancelButton = findViewById(R.id.reply_cancel_button);
 
         localStore = LocalStore.get(this);
         ArrayAdapter<CharSequence> retentionAdapter = ArrayAdapter.createFromResource(
@@ -240,6 +270,7 @@ public final class MainActivity extends Activity {
         sendButton.setOnClickListener(view -> sendMessage());
         mediaButton.setOnClickListener(view -> chooseMedia());
         leaveButton.setOnClickListener(view -> returnToLogin());
+        replyCancelButton.setOnClickListener(view -> clearReply());
         secretInput.setOnEditorActionListener((view, actionId, event) -> {
             if (actionId == EditorInfo.IME_ACTION_DONE) {
                 connect();
@@ -339,6 +370,7 @@ public final class MainActivity extends Activity {
             String sessionName,
             int sessionPresence,
             boolean sessionMediaSupported,
+            boolean sessionAdvancedSupported,
             long sessionRetentionMs
     ) {
         boolean newlyConnected = sessionConnected && !connected;
@@ -347,6 +379,7 @@ public final class MainActivity extends Activity {
         displayName = sessionName == null ? "" : sessionName;
         presence = sessionPresence;
         mediaSupported = sessionMediaSupported;
+        advancedSupported = sessionAdvancedSupported;
         retentionMs = RetentionPolicy.normalize(sessionRetentionMs);
         connectButton.setEnabled(!connecting && !connected);
 
@@ -385,8 +418,10 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "Bağlantı açık değil.", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (chatService.sendText(message)) {
+        ChatEvent.Reply reply = ChatEvent.Reply.from(replyTarget);
+        if (chatService.sendText(message, reply)) {
             messageInput.setText("");
+            clearReply();
         }
     }
 
@@ -417,6 +452,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_SAVE_MEDIA) {
+            handleDownloadResult(resultCode, data);
+            return;
+        }
         if (requestCode != REQUEST_MEDIA || resultCode != RESULT_OK || data == null) {
             return;
         }
@@ -424,11 +463,78 @@ public final class MainActivity extends Activity {
         if (uri == null) {
             return;
         }
-        if (serviceBound && chatService != null && connected) {
-            chatService.sendMedia(uri);
+        if (advancedSupported) {
+            new AlertDialog.Builder(this)
+                    .setTitle(R.string.media_send_mode_title)
+                    .setItems(
+                            new String[]{
+                                    getString(R.string.media_send_normal),
+                                    getString(R.string.media_send_view_once)
+                            },
+                            (dialog, which) -> sendSelectedMedia(uri, which == 1)
+                    )
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show();
         } else {
-            pendingMediaUri = uri;
+            sendSelectedMedia(uri, false);
         }
+    }
+
+    private void sendSelectedMedia(Uri uri, boolean viewOnce) {
+        ChatEvent.Reply reply = ChatEvent.Reply.from(replyTarget);
+        if (serviceBound && chatService != null && connected) {
+            if (chatService.sendMedia(uri, viewOnce, reply)) {
+                clearReply();
+            }
+            return;
+        }
+        pendingMediaUri = uri;
+        pendingMediaViewOnce = viewOnce;
+        pendingMediaReply = reply;
+        clearReply();
+    }
+
+    private void handleDownloadResult(int resultCode, Intent data) {
+        File source = pendingDownloadFile;
+        String name = pendingDownloadName;
+        pendingDownloadFile = null;
+        pendingDownloadMime = null;
+        pendingDownloadName = null;
+        if (
+                resultCode != RESULT_OK ||
+                data == null ||
+                data.getData() == null ||
+                source == null ||
+                !source.isFile()
+        ) {
+            return;
+        }
+        Uri destination = data.getData();
+        downloadExecutor.execute(() -> {
+            boolean saved = false;
+            byte[] buffer = new byte[64 * 1024];
+            try (FileInputStream input = new FileInputStream(source);
+                 OutputStream output = getContentResolver().openOutputStream(destination, "w")) {
+                if (output == null) {
+                    throw new IOException("Hedef açılamadı.");
+                }
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, read);
+                }
+                output.flush();
+                saved = true;
+            } catch (IOException ignored) {
+            }
+            boolean completed = saved;
+            runOnUiThread(() -> Toast.makeText(
+                    MainActivity.this,
+                    completed
+                            ? getString(R.string.media_downloaded, name)
+                            : getString(R.string.media_download_failed),
+                    Toast.LENGTH_LONG
+            ).show());
+        });
     }
 
     private void askNotificationPermission() {
@@ -478,10 +584,18 @@ public final class MainActivity extends Activity {
         connected = false;
         connecting = false;
         mediaSupported = false;
+        advancedSupported = false;
         displayName = "";
         presence = 0;
         lastRenderedEventId = 0;
         pendingMediaUri = null;
+        pendingMediaViewOnce = false;
+        pendingMediaReply = null;
+        pendingDownloadFile = null;
+        pendingDownloadMime = null;
+        pendingDownloadName = null;
+        messageViews.clear();
+        clearReply();
         messagesContainer.removeAllViews();
         messageInput.setText("");
         secretInput.setText("");
@@ -498,6 +612,7 @@ public final class MainActivity extends Activity {
 
     private void replaceVisibleHistory(List<ChatEvent> events) {
         messagesContainer.removeAllViews();
+        messageViews.clear();
         lastRenderedEventId = 0;
         for (ChatEvent event : new ArrayList<>(events)) {
             renderEvent(event);
@@ -666,6 +781,7 @@ public final class MainActivity extends Activity {
         LinearLayout bubble = createBubble(event.own);
         int maxContentWidth = maxBubbleContentWidth();
         bubble.addView(createSenderView(event.sender, event.own, maxContentWidth));
+        addReplyPreview(bubble, event, maxContentWidth);
 
         TextView messageView = new TextView(this);
         messageView.setText(event.text);
@@ -682,7 +798,7 @@ public final class MainActivity extends Activity {
         messageView.setLayoutParams(messageParams);
         bubble.addView(messageView);
 
-        String time = addTimeView(bubble, event.sentAt, event.own);
+        String time = addTimeView(bubble, event);
         bubble.setContentDescription(getString(
                 R.string.message_accessibility,
                 event.sender,
@@ -690,18 +806,48 @@ public final class MainActivity extends Activity {
                 time
         ));
         bubble.setOnLongClickListener(view -> {
-            copyMessage(event.text);
+            showTextActions(event);
             return true;
         });
-        addToMessageList(bubble);
+        registerMessageBubble(event, bubble);
     }
 
     private void addMediaMessage(ChatEvent event) {
         LinearLayout bubble = createBubble(event.own);
         int maxContentWidth = maxBubbleContentWidth();
         bubble.addView(createSenderView(event.sender, event.own, maxContentWidth));
+        addReplyPreview(bubble, event, maxContentWidth);
 
-        if (event.mimeType.startsWith("image/")) {
+        View mediaContent;
+        if (event.viewOnce) {
+            String label;
+            if (event.own) {
+                label = "① Tek gösterimlik " +
+                        (event.mimeType.startsWith("image/") ? "görsel" : "video") +
+                        " gönderildi";
+            } else if (event.viewOnceConsumed || event.mediaFile == null || !event.mediaFile.isFile()) {
+                label = "① Tek gösterimlik içerik açıldı";
+            } else {
+                label = "① Tek gösterimlik " +
+                        (event.mimeType.startsWith("image/") ? "görsel" : "video") +
+                        "\nAçmak için dokunun";
+            }
+            TextView viewOnceView = createMediaFallback(label, event.own, maxContentWidth);
+            if (
+                    !event.own &&
+                    !event.viewOnceConsumed &&
+                    event.mediaFile != null &&
+                    event.mediaFile.isFile()
+            ) {
+                viewOnceView.setOnClickListener(view -> openViewOnce(event));
+            }
+            mediaContent = viewOnceView;
+            bubble.addView(viewOnceView);
+        } else if (
+                event.mimeType.startsWith("image/") &&
+                event.mediaFile != null &&
+                event.mediaFile.isFile()
+        ) {
             Bitmap preview = decodeSampledBitmap(event.mediaFile, 1_600, 1_600);
             if (preview != null) {
                 ImageView imageView = new ImageView(this);
@@ -719,19 +865,79 @@ public final class MainActivity extends Activity {
                 imageView.setLayoutParams(imageParams);
                 imageView.setOnClickListener(view -> showImageDialog(event.mediaFile));
                 bubble.addView(imageView);
+                mediaContent = imageView;
             } else {
-                bubble.addView(createMediaFallback("Görsel açılamadı", event.own, maxContentWidth));
+                mediaContent = createMediaFallback(
+                        "Görsel açılamadı",
+                        event.own,
+                        maxContentWidth
+                );
+                bubble.addView(mediaContent);
             }
-        } else {
+        } else if (event.mediaFile != null && event.mediaFile.isFile()) {
             String label = "▶ Video\n" + event.displayName + " • " + formatBytes(event.size);
             TextView videoView = createMediaFallback(label, event.own, maxContentWidth);
             videoView.setContentDescription(getString(R.string.media_video_description));
             videoView.setOnClickListener(view -> showVideoDialog(event.mediaFile));
             bubble.addView(videoView);
+            mediaContent = videoView;
+        } else {
+            mediaContent = createMediaFallback(
+                    "Medya artık kullanılamıyor",
+                    event.own,
+                    maxContentWidth
+            );
+            bubble.addView(mediaContent);
         }
 
-        addTimeView(bubble, event.sentAt, event.own);
-        addToMessageList(bubble);
+        View.OnLongClickListener actions = view -> {
+            showMediaActions(event);
+            return true;
+        };
+        mediaContent.setOnLongClickListener(actions);
+        bubble.setOnLongClickListener(actions);
+        addTimeView(bubble, event);
+        registerMessageBubble(event, bubble);
+    }
+
+    private void addReplyPreview(LinearLayout bubble, ChatEvent event, int maxWidth) {
+        if (
+                event.replyMessageId == null ||
+                event.replySender == null ||
+                event.replyPreview == null
+        ) {
+            return;
+        }
+        TextView preview = new TextView(this);
+        preview.setText(getString(
+                R.string.reply_quote,
+                event.replySender,
+                event.replyPreview
+        ));
+        preview.setTextColor(event.own ? Color.WHITE : Color.parseColor("#2444AE"));
+        preview.setTextSize(12);
+        preview.setMaxLines(3);
+        preview.setEllipsize(TextUtils.TruncateAt.END);
+        preview.setMaxWidth(maxWidth);
+        preview.setPadding(dp(10), dp(7), dp(10), dp(7));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(event.own
+                ? Color.parseColor("#496BE0")
+                : Color.parseColor("#EEF2FF"));
+        background.setCornerRadius(dp(9));
+        background.setStroke(dp(1), event.own
+                ? Color.parseColor("#7590EC")
+                : Color.parseColor("#C7D2FE"));
+        preview.setBackground(background);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        params.topMargin = dp(5);
+        params.bottomMargin = dp(3);
+        preview.setLayoutParams(params);
+        preview.setOnClickListener(view -> scrollToMessage(event.replyMessageId));
+        bubble.addView(preview);
     }
 
     private LinearLayout createBubble(boolean ownMessage) {
@@ -780,27 +986,210 @@ public final class MainActivity extends Activity {
         return view;
     }
 
-    private String addTimeView(LinearLayout bubble, long sentAt, boolean ownMessage) {
-        String time = DateFormat.getTimeFormat(this).format(new Date(sentAt));
-        TextView timeView = new TextView(this);
-        timeView.setText(time);
-        timeView.setTextColor(ownMessage ? Color.parseColor("#DCE5FF") : Color.parseColor("#64748B"));
-        timeView.setTextSize(11);
-        timeView.setGravity(Gravity.END);
-        LinearLayout.LayoutParams timeParams = new LinearLayout.LayoutParams(
+    private String addTimeView(LinearLayout bubble, ChatEvent event) {
+        String time = DateFormat.getTimeFormat(this).format(new Date(event.sentAt));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
         );
-        timeParams.topMargin = dp(4);
-        timeView.setLayoutParams(timeParams);
-        bubble.addView(timeView);
+        rowParams.topMargin = dp(4);
+        row.setLayoutParams(rowParams);
+
+        TextView timeView = new TextView(this);
+        timeView.setText(time);
+        timeView.setTextColor(event.own
+                ? Color.parseColor("#DCE5FF")
+                : Color.parseColor("#64748B"));
+        timeView.setTextSize(11);
+        timeView.setGravity(Gravity.END);
+        row.addView(timeView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+        if (event.own && event.deliveryStatus != ChatEvent.STATUS_NONE) {
+            TextView statusView = new TextView(this);
+            String status;
+            if (event.deliveryStatus == ChatEvent.STATUS_PENDING) {
+                status = " ◷";
+            } else if (event.deliveryStatus == ChatEvent.STATUS_SENT) {
+                status = " ✓";
+            } else {
+                status = " ✓✓";
+            }
+            statusView.setText(status);
+            statusView.setTextSize(12);
+            statusView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            statusView.setTextColor(event.deliveryStatus == ChatEvent.STATUS_SEEN
+                    ? Color.parseColor("#7EE7FF")
+                    : Color.parseColor("#DCE5FF"));
+            row.addView(statusView, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+            ));
+        }
+        bubble.addView(row);
         return time;
     }
 
+    private void showTextActions(ChatEvent event) {
+        if (event.messageId == null) {
+            new AlertDialog.Builder(this)
+                    .setItems(
+                            new String[]{getString(R.string.action_copy)},
+                            (dialog, which) -> copyMessage(event.text)
+                    )
+                    .show();
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setItems(
+                        new String[]{
+                                getString(R.string.action_reply),
+                                getString(R.string.action_copy)
+                        },
+                        (dialog, which) -> {
+                            if (which == 0) {
+                                startReply(event);
+                            } else {
+                                copyMessage(event.text);
+                            }
+                        }
+                )
+                .show();
+    }
+
+    private void showMediaActions(ChatEvent event) {
+        boolean canReply = event.messageId != null;
+        boolean canDownload =
+                !event.viewOnce &&
+                event.mediaFile != null &&
+                event.mediaFile.isFile();
+        List<String> options = new ArrayList<>();
+        if (canReply) {
+            options.add(getString(R.string.action_reply));
+        }
+        if (canDownload) {
+            options.add(getString(R.string.action_download));
+        }
+        if (options.isEmpty()) {
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setItems(options.toArray(new String[0]), (dialog, which) -> {
+                    String selected = options.get(which);
+                    if (selected.equals(getString(R.string.action_reply))) {
+                        startReply(event);
+                    } else {
+                        downloadMedia(event);
+                    }
+                })
+                .show();
+    }
+
+    private void startReply(ChatEvent event) {
+        ChatEvent.Reply reply = ChatEvent.Reply.from(event);
+        if (reply == null) {
+            Toast.makeText(this, R.string.reply_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        replyTarget = event;
+        replyText.setText(getString(R.string.reply_quote, event.sender, reply.preview));
+        replyPanel.setVisibility(View.VISIBLE);
+        messageInput.requestFocus();
+    }
+
+    private void clearReply() {
+        replyTarget = null;
+        if (replyPanel != null) {
+            replyPanel.setVisibility(View.GONE);
+        }
+        if (replyText != null) {
+            replyText.setText("");
+        }
+    }
+
+    private void scrollToMessage(String messageId) {
+        View target = messageViews.get(messageId);
+        if (target == null || target.getParent() == null) {
+            Toast.makeText(this, R.string.reply_original_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        messagesScroll.smoothScrollTo(0, Math.max(0, target.getTop() - dp(12)));
+    }
+
+    private void registerMessageBubble(ChatEvent event, View bubble) {
+        addToMessageList(bubble);
+        if (event.messageId != null) {
+            messageViews.put(event.messageId, bubble);
+        }
+        messageViews.entrySet().removeIf(entry -> entry.getValue().getParent() == null);
+    }
+
+    private void downloadMedia(ChatEvent event) {
+        if (
+                event.viewOnce ||
+                event.mediaFile == null ||
+                !event.mediaFile.isFile()
+        ) {
+            return;
+        }
+        pendingDownloadFile = event.mediaFile;
+        pendingDownloadMime = event.mimeType;
+        pendingDownloadName = event.displayName;
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType(event.mimeType)
+                .putExtra(Intent.EXTRA_TITLE, event.displayName);
+        try {
+            startActivityForResult(intent, REQUEST_SAVE_MEDIA);
+        } catch (RuntimeException exception) {
+            pendingDownloadFile = null;
+            pendingDownloadMime = null;
+            pendingDownloadName = null;
+            Toast.makeText(this, R.string.media_download_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void openViewOnce(ChatEvent event) {
+        if (
+                !serviceBound ||
+                chatService == null ||
+                event.messageId == null ||
+                event.mediaFile == null ||
+                !event.mediaFile.isFile() ||
+                !chatService.claimViewOnce(event.messageId)
+        ) {
+            Toast.makeText(this, R.string.view_once_unavailable, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Runnable finished = () -> {
+            if (serviceBound && chatService != null) {
+                chatService.finishViewOnce(event.messageId);
+            } else {
+                event.mediaFile.delete();
+            }
+        };
+        if (event.mimeType.startsWith("image/")) {
+            showImageDialog(event.mediaFile, finished);
+        } else {
+            showVideoDialog(event.mediaFile, finished);
+        }
+    }
+
     private void showImageDialog(File file) {
+        showImageDialog(file, null);
+    }
+
+    private void showImageDialog(File file, Runnable onDismiss) {
         Bitmap bitmap = decodeSampledBitmap(file, 2_048, 2_048);
         if (bitmap == null) {
             Toast.makeText(this, "Görsel açılamadı.", Toast.LENGTH_SHORT).show();
+            if (onDismiss != null) {
+                onDismiss.run();
+            }
             return;
         }
         Dialog dialog = new Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar_Fullscreen);
@@ -810,6 +1199,9 @@ public final class MainActivity extends Activity {
         image.setScaleType(ImageView.ScaleType.FIT_CENTER);
         image.setOnClickListener(view -> dialog.dismiss());
         dialog.setContentView(image);
+        if (onDismiss != null) {
+            dialog.setOnDismissListener(ignored -> onDismiss.run());
+        }
         dialog.show();
         Window window = dialog.getWindow();
         if (window != null) {
@@ -818,6 +1210,10 @@ public final class MainActivity extends Activity {
     }
 
     private void showVideoDialog(File file) {
+        showVideoDialog(file, null);
+    }
+
+    private void showVideoDialog(File file, Runnable onDismiss) {
         Dialog dialog = new Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar_Fullscreen);
         FrameLayout frame = new FrameLayout(this);
         frame.setBackgroundColor(Color.BLACK);
@@ -828,7 +1224,12 @@ public final class MainActivity extends Activity {
                 Gravity.CENTER
         ));
         dialog.setContentView(frame);
-        dialog.setOnDismissListener(ignored -> video.stopPlayback());
+        dialog.setOnDismissListener(ignored -> {
+            video.stopPlayback();
+            if (onDismiss != null) {
+                onDismiss.run();
+            }
+        });
         dialog.show();
         Window window = dialog.getWindow();
         if (window != null) {
@@ -977,6 +1378,12 @@ public final class MainActivity extends Activity {
         View root = findViewById(R.id.root_container);
         root.requestApplyInsets();
         scrollToLatestMessage();
+    }
+
+    @Override
+    protected void onDestroy() {
+        downloadExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     private int dp(int value) {

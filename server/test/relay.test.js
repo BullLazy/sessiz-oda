@@ -119,9 +119,12 @@ test("relay iletir, geçmişi oynatmaz ve oda sınırını uygular", async (cont
     assert.equal(health.headers.get("cache-control"), "no-store");
     assert.deepEqual(await health.json(), {
         status: "ok",
-        protocol: 3,
+        protocol: 4,
         media: true,
-        notifications: true
+        notifications: true,
+        receipts: true,
+        replies: true,
+        viewOnce: true
     });
 
     const first = await connect(`${baseUrl}/chat`);
@@ -132,12 +135,22 @@ test("relay iletir, geçmişi oynatmaz ve oda sınırını uygular", async (cont
     const firstJoined = await first.inbox.next((message) => message.type === "joined");
     const secondJoined = await second.inbox.next((message) => message.type === "joined");
     assert.deepEqual(
-        { protocol: firstJoined.protocol, media: firstJoined.media, notifications: firstJoined.notifications },
-        { protocol: 3, media: 1, notifications: 1 }
+        {
+            protocol: firstJoined.protocol,
+            media: firstJoined.media,
+            notifications: firstJoined.notifications,
+            receipts: firstJoined.receipts
+        },
+        { protocol: 4, media: 1, notifications: 1, receipts: 1 }
     );
     assert.deepEqual(
-        { protocol: secondJoined.protocol, media: secondJoined.media, notifications: secondJoined.notifications },
-        { protocol: 3, media: 1, notifications: 1 }
+        {
+            protocol: secondJoined.protocol,
+            media: secondJoined.media,
+            notifications: secondJoined.notifications,
+            receipts: secondJoined.receipts
+        },
+        { protocol: 4, media: 1, notifications: 1, receipts: 1 }
     );
     await first.inbox.next((message) => message.type === "presence" && message.count === 2);
 
@@ -171,6 +184,50 @@ test("relay iletir, geçmişi oynatmaz ve oda sınırını uygular", async (cont
     fourth.socket.send(memberJoin("4".repeat(32)));
     const refusal = await fourth.inbox.next((message) => message.type === "error");
     assert.equal(refusal.code, "room_full");
+});
+
+test("v1.5 kabul ve şifreli teslim makbuzlarını kaynak cihaza iletir", async (context) => {
+    const { sockets, baseUrl } = await startRelay(context, { maxRoomSize: 2 });
+    const first = await connect(`${baseUrl}/chat`);
+    const second = await connect(`${baseUrl}/chat`);
+    sockets.push(first.socket, second.socket);
+    first.socket.send(memberJoin(CLIENT_A));
+    second.socket.send(memberJoin(CLIENT_B));
+    await first.inbox.next((message) => message.type === "joined");
+    await second.inbox.next((message) => message.type === "joined");
+    await first.inbox.next((message) => message.type === "presence" && message.count === 2);
+
+    const messageId = "d".repeat(32);
+    first.socket.send(JSON.stringify({
+        type: "cipher",
+        kind: "text",
+        id: messageId,
+        payload: PAYLOAD
+    }));
+    const accepted = await first.inbox.next(
+        (message) => message.type === "accepted" && message.id === messageId
+    );
+    assert.equal(accepted.recipients, 1);
+    const delivered = await second.inbox.next(
+        (message) => message.type === "cipher" && message.payload === PAYLOAD
+    );
+    assert.equal(delivered.kind, "text");
+    await first.inbox.expectNone(
+        (message) => message.type === "cipher" && message.payload === PAYLOAD
+    );
+
+    const receiptPayload = "R".repeat(24);
+    second.socket.send(JSON.stringify({
+        type: "cipher",
+        kind: "receipt",
+        payload: receiptPayload
+    }));
+    const receipt = await first.inbox.next(
+        (message) => message.type === "cipher" && message.payload === receiptPayload
+    );
+    assert.equal(receipt.kind, "receipt");
+    assert.equal(first.socket.readyState, WebSocket.OPEN);
+    assert.equal(second.socket.readyState, WebSocket.OPEN);
 });
 
 test("yüksek boyutlu medya ve yoğun mesaj bağlantıyı koparmaz", async (context) => {
@@ -300,7 +357,7 @@ test("bildirim izleyicisi kişi sayısına girmez ve yalnız etkinlik alır", as
             protocol: monitorJoined.protocol,
             notifications: monitorJoined.notifications
         },
-        { mode: "monitor", protocol: 3, notifications: 1 }
+        { mode: "monitor", protocol: 4, notifications: 1 }
     );
 
     const first = await connect(`${baseUrl}/chat`);
@@ -321,6 +378,16 @@ test("bildirim izleyicisi kişi sayısına girmez ve yalnız etkinlik alır", as
     const activity = await monitor.inbox.next((message) => message.type === "activity");
     assert.equal(activity.room, ROOM);
     await monitor.inbox.expectNone((message) => message.type === "cipher");
+
+    second.socket.send(JSON.stringify({
+        type: "cipher",
+        kind: "receipt",
+        payload: "R".repeat(24)
+    }));
+    await first.inbox.next(
+        (message) => message.type === "cipher" && message.kind === "receipt"
+    );
+    await monitor.inbox.expectNone((message) => message.type === "activity");
 
     first.socket.send(JSON.stringify({
         type: "cipher",

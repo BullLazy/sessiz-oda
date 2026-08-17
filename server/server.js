@@ -6,7 +6,7 @@ const { TextDecoder } = require("node:util");
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 
 function boundedInteger(value, fallback, minimum, maximum) {
     const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -17,8 +17,18 @@ function boundedInteger(value, fallback, minimum, maximum) {
 }
 
 function createRelayServer(options = {}) {
-    const maxRoomSize = boundedInteger(options.maxRoomSize ?? process.env.MAX_ROOM_SIZE, 50, 2, 100);
-    const maxConnections = boundedInteger(options.maxConnections ?? process.env.MAX_CONNECTIONS, 500, 3, 2_000);
+    const maxRoomSize = boundedInteger(
+        options.maxRoomSize ?? process.env.MAX_ROOM_SIZE,
+        50,
+        2,
+        100
+    );
+    const maxConnections = boundedInteger(
+        options.maxConnections ?? process.env.MAX_CONNECTIONS,
+        500,
+        3,
+        2_000
+    );
     const maxFrameBytes = boundedInteger(options.maxFrameBytes, 65_536, 4_096, 262_144);
     const heartbeatMs = boundedInteger(options.heartbeatMs, 15_000, 1_000, 120_000);
     const joinTimeoutMs = boundedInteger(options.joinTimeoutMs, 8_000, 1_000, 30_000);
@@ -41,7 +51,15 @@ function createRelayServer(options = {}) {
 
         if (request.method === "GET" && pathname === "/health") {
             response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-            response.end('{"status":"ok","protocol":3,"media":true,"notifications":true}');
+            response.end(JSON.stringify({
+                status: "ok",
+                protocol: PROTOCOL_VERSION,
+                media: true,
+                notifications: true,
+                receipts: true,
+                replies: true,
+                viewOnce: true
+            }));
             return;
         }
 
@@ -70,7 +88,9 @@ function createRelayServer(options = {}) {
         const connection = String(request.headers.connection ?? "").toLowerCase();
         const version = String(request.headers["sec-websocket-version"] ?? "");
         const key = String(request.headers["sec-websocket-key"] ?? "");
-        const validKey = /^[A-Za-z0-9+/]{22}==$/.test(key) && Buffer.from(key, "base64").length === 16;
+        const validKey =
+            /^[A-Za-z0-9+/]{22}==$/.test(key) &&
+            Buffer.from(key, "base64").length === 16;
 
         if (
             request.method !== "GET" ||
@@ -105,15 +125,16 @@ function createRelayServer(options = {}) {
             joined: false,
             mode: null,
             roomKey: null,
+            roomId: null,
             watchRoomKeys: new Set(),
             clientId: null,
             alive: true,
             closed: false,
+            cleaned: false,
             mediaCapable: false,
             fragmentOpcode: null,
             fragments: [],
             fragmentBytes: 0,
-            lastLegacyMediaActivityAt: 0,
             waitingForDrain: new Set(),
             drainSources: new Set(),
             joinTimer: null
@@ -149,116 +170,148 @@ function createRelayServer(options = {}) {
                 continue;
             }
             if (!client.alive) {
-                client.socket.destroy();
-                cleanupClient(client);
+                closeClient(client, 1001, "Heartbeat timeout");
                 continue;
             }
             client.alive = false;
-            sendFrame(client, 0x9, Buffer.alloc(0));
+            sendFrame(client, 0x9, Buffer.alloc(0), null);
         }
     }, heartbeatMs);
     heartbeat.unref();
 
     function handleSocketData(client, chunk) {
-        if (client.closed) {
+        if (client.closed || !Buffer.isBuffer(chunk)) {
             return;
         }
         client.alive = true;
-        client.buffer = Buffer.concat([client.buffer, chunk]);
-        if (client.buffer.length > maxFrameBytes * 2) {
+        if (client.buffer.length + chunk.length > maxFrameBytes * 2 + 32) {
             closeClient(client, 1009, "Frame too large");
             return;
         }
+        client.buffer = client.buffer.length === 0
+            ? chunk
+            : Buffer.concat([client.buffer, chunk]);
 
-        try {
-            while (true) {
-                const frame = readClientFrame(client.buffer, maxFrameBytes);
-                if (frame === null) {
-                    return;
-                }
-                client.buffer = client.buffer.subarray(frame.bytesConsumed);
-                handleFrame(client, frame);
-                if (client.closed) {
-                    return;
-                }
-                if (client.waitingForDrain.size > 0) {
-                    return;
-                }
+        while (!client.closed) {
+            if (client.buffer.length < 2) {
+                return;
             }
-        } catch {
-            closeClient(client, 1002, "Protocol error");
+            const first = client.buffer[0];
+            const second = client.buffer[1];
+            const fin = (first & 0x80) !== 0;
+            const opcode = first & 0x0f;
+            const masked = (second & 0x80) !== 0;
+            let payloadLength = second & 0x7f;
+            let offset = 2;
+
+            if ((first & 0x70) !== 0 || !masked) {
+                closeClient(client, 1002, "Invalid frame");
+                return;
+            }
+            if (payloadLength === 126) {
+                if (client.buffer.length < 4) {
+                    return;
+                }
+                payloadLength = client.buffer.readUInt16BE(2);
+                offset = 4;
+            } else if (payloadLength === 127) {
+                if (client.buffer.length < 10) {
+                    return;
+                }
+                const longLength = client.buffer.readBigUInt64BE(2);
+                if (longLength > BigInt(maxFrameBytes)) {
+                    closeClient(client, 1009, "Frame too large");
+                    return;
+                }
+                payloadLength = Number(longLength);
+                offset = 10;
+            }
+            if (
+                payloadLength > maxFrameBytes ||
+                ((opcode & 0x08) !== 0 && (!fin || payloadLength > 125))
+            ) {
+                closeClient(client, 1009, "Frame too large");
+                return;
+            }
+            const totalLength = offset + 4 + payloadLength;
+            if (client.buffer.length < totalLength) {
+                return;
+            }
+            const mask = client.buffer.subarray(offset, offset + 4);
+            const payload = Buffer.from(
+                client.buffer.subarray(offset + 4, totalLength)
+            );
+            for (let index = 0; index < payload.length; index += 1) {
+                payload[index] ^= mask[index & 3];
+            }
+            client.buffer = client.buffer.subarray(totalLength);
+            handleFrame(client, fin, opcode, payload);
         }
     }
 
-    function handleFrame(client, frame) {
-        if (frame.opcode >= 0x8) {
-            if (!frame.fin || frame.payload.length > 125) {
-                closeClient(client, 1002, "Invalid control frame");
-                return;
-            }
-            switch (frame.opcode) {
-            case 0x8:
-                sendFrame(client, 0x8, frame.payload.subarray(0, 125));
-                client.socket.end();
-                cleanupClient(client);
-                break;
-            case 0x9:
-                sendFrame(client, 0xA, frame.payload);
-                break;
-            case 0xA:
-                client.alive = true;
-                break;
-            default:
-                closeClient(client, 1003, "Unsupported frame");
-                break;
-            }
+    function handleFrame(client, fin, opcode, payload) {
+        if (opcode === 0x8) {
+            closeClient(client, 1000, "Closed");
             return;
         }
-
-        if (frame.opcode === 0x0) {
+        if (opcode === 0x9) {
+            sendFrame(client, 0xA, payload, null);
+            return;
+        }
+        if (opcode === 0xA) {
+            client.alive = true;
+            return;
+        }
+        if (opcode === 0x2) {
+            closeClient(client, 1003, "Binary unsupported");
+            return;
+        }
+        if (opcode === 0x0) {
             if (client.fragmentOpcode === null) {
                 closeClient(client, 1002, "Unexpected continuation");
                 return;
             }
-            client.fragments.push(frame.payload);
-            client.fragmentBytes += frame.payload.length;
+            client.fragments.push(payload);
+            client.fragmentBytes += payload.length;
             if (client.fragmentBytes > maxFrameBytes) {
                 closeClient(client, 1009, "Message too large");
                 return;
             }
-            if (frame.fin) {
-                const opcode = client.fragmentOpcode;
-                const payload = Buffer.concat(client.fragments, client.fragmentBytes);
-                client.fragmentOpcode = null;
-                client.fragments = [];
-                client.fragmentBytes = 0;
-                handleDataFrame(client, opcode, payload);
+            if (!fin) {
+                return;
+            }
+            const complete = Buffer.concat(client.fragments, client.fragmentBytes);
+            const originalOpcode = client.fragmentOpcode;
+            client.fragmentOpcode = null;
+            client.fragments = [];
+            client.fragmentBytes = 0;
+            if (originalOpcode === 0x1) {
+                handleTextPayload(client, complete);
             }
             return;
         }
-
-        if (frame.opcode !== 0x1 && frame.opcode !== 0x2) {
-            closeClient(client, 1003, "Unsupported frame");
+        if (opcode !== 0x1) {
+            closeClient(client, 1002, "Unknown opcode");
+            return;
+        }
+        if (!fin) {
+            if (client.fragmentOpcode !== null) {
+                closeClient(client, 1002, "Nested fragments");
+                return;
+            }
+            client.fragmentOpcode = opcode;
+            client.fragments = [payload];
+            client.fragmentBytes = payload.length;
             return;
         }
         if (client.fragmentOpcode !== null) {
-            closeClient(client, 1002, "Fragment already open");
+            closeClient(client, 1002, "Invalid fragment");
             return;
         }
-        if (frame.fin) {
-            handleDataFrame(client, frame.opcode, frame.payload);
-            return;
-        }
-        client.fragmentOpcode = frame.opcode;
-        client.fragments = [frame.payload];
-        client.fragmentBytes = frame.payload.length;
+        handleTextPayload(client, payload);
     }
 
-    function handleDataFrame(client, opcode, payload) {
-        if (opcode !== 0x1) {
-            closeClient(client, 1003, "Binary messages unsupported");
-            return;
-        }
+    function handleTextPayload(client, payload) {
         let text;
         try {
             text = UTF8_DECODER.decode(payload);
@@ -266,182 +319,129 @@ function createRelayServer(options = {}) {
             closeClient(client, 1007, "Invalid UTF-8");
             return;
         }
-        handleTextMessage(client, text);
-    }
-
-    function handleTextMessage(client, text) {
-        if (text.length > 40_000) {
-            closeClient(client, 1009, "Message too large");
-            return;
-        }
-
         let message;
         try {
             message = JSON.parse(text);
         } catch {
-            closeClient(client, 1007, "Invalid JSON");
+            sendJson(client, { type: "error", code: "invalid_message" });
             return;
         }
-
+        if (!message || typeof message !== "object" || Array.isArray(message)) {
+            sendJson(client, { type: "error", code: "invalid_message" });
+            return;
+        }
         if (!client.joined) {
-            if (message.type === "monitor") {
-                handleMonitorJoin(client, message);
-                return;
-            }
-            if (
-                message.type !== "join" ||
-                typeof message.room !== "string" ||
-                typeof message.proof !== "string" ||
-                !/^[a-f0-9]{64}$/.test(message.room) ||
-                !/^[a-f0-9]{64}$/.test(message.proof)
-            ) {
+            if (message.type === "join") {
+                joinMember(client, message);
+            } else if (message.type === "monitor") {
+                joinMonitor(client, message);
+            } else {
                 sendJson(client, { type: "error", code: "join_required" });
-                closeClient(client, 1008, "Join required");
-                return;
             }
-
-            const roomKey = `${message.room}.${message.proof}`;
-            const room = getOrCreateRoom(roomKey, message.room);
-            const clientId = validClientId(message.client) ? message.client : null;
-            if (clientId !== null) {
-                for (const previous of [...room.members]) {
-                    if (previous !== client && previous.clientId === clientId) {
-                        room.members.delete(previous);
-                        previous.roomKey = null;
-                        closeClient(previous, 4000, "Session replaced");
-                    }
-                }
-            }
-            if (room.members.size >= maxRoomSize) {
-                maybeDeleteRoom(roomKey, room);
-                sendJson(client, { type: "error", code: "room_full" });
-                closeClient(client, 1008, "Room full");
-                return;
-            }
-
-            clearTimeout(client.joinTimer);
-            client.joinTimer = null;
-            client.joined = true;
-            client.mode = "member";
-            client.roomKey = roomKey;
-            client.clientId = clientId;
-            client.mediaCapable = message.media === 1;
-            room.members.add(client);
-            sendJson(client, {
-                type: "joined",
-                protocol: PROTOCOL_VERSION,
-                media: 1,
-                notifications: 1
-            });
-            broadcastPresence(room);
             return;
         }
-
-        if (
-            client.mode !== "member" ||
-            message.type !== "cipher" ||
-            typeof message.payload !== "string"
-        ) {
-            closeClient(client, 1008, "Invalid message");
+        if (client.mode !== "member" || message.type !== "cipher") {
+            sendJson(client, { type: "error", code: "invalid_message" });
             return;
         }
-
-        const kind = message.kind ?? "text";
-        if (kind !== "text" && kind !== "media") {
-            closeClient(client, 1008, "Invalid payload");
-            return;
-        }
-
-        if (kind === "media" && !client.mediaCapable) {
-            closeClient(client, 1008, "Media capability required");
-            return;
-        }
-
-        const stage = message.stage;
-        if (
-            kind === "media" &&
-            stage !== undefined &&
-            stage !== "start" &&
-            stage !== "chunk" &&
-            stage !== "end"
-        ) {
-            closeClient(client, 1008, "Invalid media stage");
-            return;
-        }
-
-        const payloadLimit = kind === "media" ? 32_000 : 12_000;
-        if (
-            message.payload.length < 24 ||
-            message.payload.length > payloadLimit ||
-            !/^[A-Za-z0-9+/]+={0,2}$/.test(message.payload)
-        ) {
-            closeClient(client, 1008, "Invalid payload");
-            return;
-        }
-
-        const room = rooms.get(client.roomKey);
-        if (!room) {
-            closeClient(client, 1011, "Room unavailable");
-            return;
-        }
-        const outgoing = { type: "cipher", kind, payload: message.payload };
-        if (kind === "media") {
-            broadcastMedia(room, outgoing, client);
-        } else {
-            broadcastMembers(room, outgoing, client);
-        }
-        broadcastActivity(room, client, kind, stage);
+        relayCipher(client, message);
     }
 
-    function handleMonitorJoin(client, message) {
+    function joinMember(client, message) {
+        const roomId = String(message.room ?? "");
+        const proof = String(message.proof ?? "");
+        const clientId = String(message.client ?? "");
+        const mediaCapable = message.media === 1;
         if (
-            !validClientId(message.client) ||
-            !Array.isArray(message.rooms) ||
-            message.rooms.length < 1 ||
-            message.rooms.length > 30
+            !validHex(roomId, 64) ||
+            !validHex(proof, 64) ||
+            !validHex(clientId, 32)
         ) {
             sendJson(client, { type: "error", code: "join_required" });
-            closeClient(client, 1008, "Monitor join required");
+            closeClient(client, 1008, "Invalid join");
             return;
         }
-
-        const subscriptions = new Map();
-        for (const entry of message.rooms) {
-            if (
-                entry === null ||
-                typeof entry !== "object" ||
-                typeof entry.room !== "string" ||
-                typeof entry.proof !== "string" ||
-                !/^[a-f0-9]{64}$/.test(entry.room) ||
-                !/^[a-f0-9]{64}$/.test(entry.proof)
-            ) {
-                sendJson(client, { type: "error", code: "join_required" });
-                closeClient(client, 1008, "Invalid monitor room");
-                return;
-            }
-            subscriptions.set(`${entry.room}.${entry.proof}`, entry.room);
+        const roomKey = keyFor(roomId, proof);
+        let room = rooms.get(roomKey);
+        if (!room) {
+            room = { roomId, proof, members: new Set() };
+            rooms.set(roomKey, room);
         }
 
-        for (const previous of [...clients]) {
-            if (
-                previous !== client &&
-                previous.mode === "monitor" &&
-                previous.clientId === message.client
-            ) {
-                closeClient(previous, 4000, "Monitor replaced");
+        let replaced = null;
+        for (const member of room.members) {
+            if (member.clientId === clientId) {
+                replaced = member;
+                break;
             }
+        }
+        if (replaced) {
+            sendJson(replaced, { type: "error", code: "session_replaced" });
+            closeClient(replaced, 4000, "Session replaced");
+            if (!rooms.has(roomKey)) {
+                rooms.set(roomKey, room);
+            }
+        }
+        if (room.members.size >= maxRoomSize) {
+            sendJson(client, { type: "error", code: "room_full" });
+            closeClient(client, 1008, "Room full");
+            if (room.members.size === 0) {
+                rooms.delete(roomKey);
+            }
+            return;
         }
 
         clearTimeout(client.joinTimer);
         client.joinTimer = null;
         client.joined = true;
-        client.mode = "monitor";
-        client.clientId = message.client;
-        for (const [roomKey, roomId] of subscriptions) {
-            const room = getOrCreateRoom(roomKey, roomId);
-            room.monitors.add(client);
-            client.watchRoomKeys.add(roomKey);
+        client.mode = "member";
+        client.roomKey = roomKey;
+        client.roomId = roomId;
+        client.clientId = clientId;
+        client.mediaCapable = mediaCapable;
+        room.members.add(client);
+        sendJson(client, {
+            type: "joined",
+            mode: "member",
+            protocol: PROTOCOL_VERSION,
+            media: 1,
+            notifications: 1,
+            receipts: 1,
+            replies: 1,
+            viewOnce: 1
+        });
+        broadcastPresence(room);
+    }
+
+    function joinMonitor(client, message) {
+        const clientId = String(message.client ?? "");
+        const subscriptions = Array.isArray(message.rooms) ? message.rooms : [];
+        if (
+            !validHex(clientId, 32) ||
+            subscriptions.length === 0 ||
+            subscriptions.length > 30
+        ) {
+            sendJson(client, { type: "error", code: "join_required" });
+            closeClient(client, 1008, "Invalid monitor");
+            return;
         }
+        const watched = new Set();
+        for (const subscription of subscriptions) {
+            const roomId = String(subscription?.room ?? "");
+            const proof = String(subscription?.proof ?? "");
+            if (!validHex(roomId, 64) || !validHex(proof, 64)) {
+                sendJson(client, { type: "error", code: "join_required" });
+                closeClient(client, 1008, "Invalid monitor");
+                return;
+            }
+            watched.add(keyFor(roomId, proof));
+        }
+        clearTimeout(client.joinTimer);
+        client.joinTimer = null;
+        client.joined = true;
+        client.mode = "monitor";
+        client.clientId = clientId;
+        client.watchRoomKeys = watched;
         sendJson(client, {
             type: "joined",
             mode: "monitor",
@@ -450,141 +450,149 @@ function createRelayServer(options = {}) {
         });
     }
 
-    function validClientId(value) {
-        return typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
-    }
-
-    function getOrCreateRoom(roomKey, roomId) {
-        let room = rooms.get(roomKey);
-        if (!room) {
-            room = { roomId, members: new Set(), monitors: new Set() };
-            rooms.set(roomKey, room);
+    function relayCipher(source, message) {
+        const room = rooms.get(source.roomKey);
+        if (!room || !room.members.has(source)) {
+            sendJson(source, { type: "error", code: "join_required" });
+            return;
         }
-        return room;
+
+        const kind = message.kind === undefined ? "text" : String(message.kind);
+        const payload = typeof message.payload === "string" ? message.payload : "";
+        const stage = message.stage === undefined ? null : String(message.stage);
+        const messageId = message.id === undefined ? null : String(message.id);
+        const payloadLimit = kind === "media" ? 32_000 : 12_000;
+
+        const validKind = kind === "text" || kind === "media" || kind === "receipt";
+        const validStage =
+            (kind === "text" && stage === null) ||
+            (kind === "receipt" && stage === null) ||
+            (kind === "media" && (stage === "start" || stage === "chunk" || stage === "end"));
+        const acceptsId =
+            (kind === "text" && stage === null) ||
+            kind === "media";
+        const acknowledgesId =
+            (kind === "text" && stage === null) ||
+            (kind === "media" && stage === "start");
+        if (
+            !validKind ||
+            !validStage ||
+            payload.length < 16 ||
+            payload.length > payloadLimit ||
+            (messageId !== null && (!acceptsId || !validHex(messageId, 32)))
+        ) {
+            sendJson(source, { type: "error", code: "invalid_message" });
+            return;
+        }
+
+        const targets = [];
+        for (const target of room.members) {
+            if (kind === "media" && !target.mediaCapable) {
+                continue;
+            }
+            if (messageId !== null && target === source) {
+                continue;
+            }
+            targets.push(target);
+        }
+
+        if (messageId !== null && acknowledgesId) {
+            const recipients = targets.filter((target) => target !== source).length;
+            sendJson(source, {
+                type: "accepted",
+                id: messageId,
+                recipients
+            });
+        }
+
+        const outgoing = { type: "cipher", kind, payload };
+        if (stage !== null) {
+            outgoing.stage = stage;
+        }
+        const frame = encodeFrame(0x1, Buffer.from(JSON.stringify(outgoing), "utf8"));
+        for (const target of targets) {
+            sendEncodedFrame(target, frame, source);
+        }
+
+        if (kind === "text" || (kind === "media" && stage === "start")) {
+            notifyMonitors(source);
+        }
     }
 
-    function maybeDeleteRoom(roomKey, room) {
-        if (room.members.size === 0 && room.monitors.size === 0) {
-            rooms.delete(roomKey);
+    function notifyMonitors(source) {
+        for (const monitor of clients) {
+            if (
+                monitor.mode === "monitor" &&
+                monitor.clientId !== source.clientId &&
+                monitor.watchRoomKeys.has(source.roomKey)
+            ) {
+                sendJson(monitor, { type: "activity", room: source.roomId });
+            }
         }
     }
 
     function broadcastPresence(room) {
-        broadcastMembers(room, { type: "presence", count: room.members.size });
-    }
-
-    function broadcastMembers(room, message, source = null) {
-        const encoded = Buffer.from(JSON.stringify(message), "utf8");
+        const message = { type: "presence", count: room.members.size };
         for (const member of room.members) {
-            if (!sendFrame(member, 0x1, encoded) && source !== null) {
-                pauseSourceForTarget(source, member);
-            }
+            sendJson(member, message);
         }
     }
 
-    function broadcastMedia(room, message, source) {
-        const encoded = Buffer.from(JSON.stringify(message), "utf8");
-        for (const member of room.members) {
-            if (member.mediaCapable) {
-                if (!sendFrame(member, 0x1, encoded)) {
-                    pauseSourceForTarget(source, member);
-                }
-            }
+    function sendJson(client, value) {
+        if (client.closed) {
+            return false;
         }
+        const payload = Buffer.from(JSON.stringify(value), "utf8");
+        return sendFrame(client, 0x1, payload, null);
     }
 
-    function pauseSourceForTarget(source, target) {
-        if (source.closed || target.closed || source.waitingForDrain.has(target)) {
-            return;
+    function sendFrame(client, opcode, payload, source) {
+        return sendEncodedFrame(client, encodeFrame(opcode, payload), source);
+    }
+
+    function sendEncodedFrame(client, frame, source) {
+        if (client.closed || client.socket.destroyed || !client.socket.writable) {
+            return false;
         }
-        source.waitingForDrain.add(target);
-        target.drainSources.add(source);
-        source.socket.pause();
+        let ready;
+        try {
+            ready = client.socket.write(frame);
+        } catch {
+            cleanupClient(client);
+            return false;
+        }
+        if (!ready && source && source !== client && !source.closed) {
+            client.drainSources.add(source);
+            source.waitingForDrain.add(client);
+            source.socket.pause();
+        }
+        return true;
     }
 
     function releaseDrainTarget(target) {
-        for (const source of [...target.drainSources]) {
-            target.drainSources.delete(source);
+        const sources = Array.from(target.drainSources);
+        target.drainSources.clear();
+        for (const source of sources) {
             source.waitingForDrain.delete(target);
-            if (!source.closed && source.waitingForDrain.size === 0) {
+            if (
+                source.waitingForDrain.size === 0 &&
+                !source.closed &&
+                !source.socket.destroyed
+            ) {
                 source.socket.resume();
-                if (source.buffer.length > 0) {
-                    handleSocketData(source, Buffer.alloc(0));
-                }
             }
         }
-    }
-
-    function broadcastActivity(room, source, kind, stage) {
-        if (kind === "media") {
-            if (stage !== undefined && stage !== "start") {
-                return;
-            }
-            const now = Date.now();
-            if (stage === undefined && now - source.lastLegacyMediaActivityAt < 10_000) {
-                return;
-            }
-            source.lastLegacyMediaActivityAt = now;
-        }
-        const activity = { type: "activity", room: room.roomId };
-        for (const monitor of room.monitors) {
-            if (source.clientId === null || monitor.clientId !== source.clientId) {
-                sendJson(monitor, activity);
-            }
-        }
-    }
-
-    function sendJson(client, message) {
-        sendFrame(client, 0x1, Buffer.from(JSON.stringify(message), "utf8"));
-    }
-
-    function sendFrame(client, opcode, payload) {
-        if (client.closed || !client.socket.writable) {
-            return true;
-        }
-        try {
-            return client.socket.write(encodeServerFrame(opcode, payload));
-        } catch {
-            client.socket.destroy();
-            cleanupClient(client);
-            return true;
-        }
-    }
-
-    function closeClient(client, code, reason) {
-        if (client.closed) {
-            return;
-        }
-        const reasonBytes = Buffer.from(reason, "utf8").subarray(0, 123);
-        const payload = Buffer.alloc(2 + reasonBytes.length);
-        payload.writeUInt16BE(code, 0);
-        reasonBytes.copy(payload, 2);
-        if (client.socket.writable) {
-            try {
-                client.socket.end(encodeServerFrame(0x8, payload));
-            } catch {
-                client.socket.destroy();
-            }
-        } else {
-            client.socket.destroy();
-        }
-        cleanupClient(client);
     }
 
     function cleanupClient(client) {
-        if (client.closed) {
+        if (client.cleaned) {
             return;
         }
+        client.cleaned = true;
         client.closed = true;
-        if (client.joinTimer) {
-            clearTimeout(client.joinTimer);
-            client.joinTimer = null;
-        }
+        clearTimeout(client.joinTimer);
+        client.joinTimer = null;
         clients.delete(client);
-        client.buffer = Buffer.alloc(0);
-        client.fragments = [];
-        client.fragmentBytes = 0;
-        client.fragmentOpcode = null;
 
         for (const target of client.waitingForDrain) {
             target.drainSources.delete(client);
@@ -592,134 +600,89 @@ function createRelayServer(options = {}) {
         client.waitingForDrain.clear();
         releaseDrainTarget(client);
 
-        if (client.roomKey) {
-            const roomKey = client.roomKey;
-            const room = rooms.get(roomKey);
-            if (room) {
-                const removed = room.members.delete(client);
-                if (removed && room.members.size > 0) {
+        if (client.mode === "member" && client.roomKey) {
+            const room = rooms.get(client.roomKey);
+            if (room && room.members.delete(client)) {
+                if (room.members.size === 0) {
+                    rooms.delete(client.roomKey);
+                } else {
                     broadcastPresence(room);
                 }
-                maybeDeleteRoom(roomKey, room);
-            }
-            client.roomKey = null;
-        }
-        for (const roomKey of client.watchRoomKeys) {
-            const room = rooms.get(roomKey);
-            if (room) {
-                room.monitors.delete(client);
-                maybeDeleteRoom(roomKey, room);
             }
         }
-        client.watchRoomKeys.clear();
+    }
+
+    function closeClient(client, code, reason) {
+        if (client.closed) {
+            return;
+        }
+        const reasonBytes = Buffer.from(String(reason ?? "").slice(0, 80), "utf8");
+        const payload = Buffer.alloc(2 + reasonBytes.length);
+        payload.writeUInt16BE(code, 0);
+        reasonBytes.copy(payload, 2);
+        try {
+            client.socket.write(encodeFrame(0x8, payload));
+            client.socket.end();
+        } catch {
+            client.socket.destroy();
+        }
+        cleanupClient(client);
     }
 
     server.closeAll = () => {
         clearInterval(heartbeat);
-        for (const client of [...clients]) {
+        for (const client of Array.from(clients)) {
+            closeClient(client, 1001, "Server closing");
             client.socket.destroy();
-            cleanupClient(client);
         }
-        rooms.clear();
     };
-
+    server.on("close", () => clearInterval(heartbeat));
     return server;
 }
 
-function readClientFrame(buffer, maxFrameBytes) {
-    if (buffer.length < 2) {
-        return null;
-    }
-    const first = buffer[0];
-    const second = buffer[1];
-    if ((first & 0x70) !== 0 || (second & 0x80) === 0) {
-        throw new Error("Invalid frame");
-    }
-
-    const fin = (first & 0x80) !== 0;
-    const opcode = first & 0x0f;
-    let length = second & 0x7f;
-    let offset = 2;
-
-    if (length === 126) {
-        if (buffer.length < 4) {
-            return null;
-        }
-        length = buffer.readUInt16BE(2);
-        offset = 4;
-    } else if (length === 127) {
-        if (buffer.length < 10) {
-            return null;
-        }
-        const wideLength = buffer.readBigUInt64BE(2);
-        if (wideLength > BigInt(maxFrameBytes)) {
-            throw new Error("Frame too large");
-        }
-        length = Number(wideLength);
-        offset = 10;
-    }
-
-    if (length > maxFrameBytes || buffer.length < offset + 4 + length) {
-        if (length > maxFrameBytes) {
-            throw new Error("Frame too large");
-        }
-        return null;
-    }
-
-    const mask = buffer.subarray(offset, offset + 4);
-    offset += 4;
-    const payload = Buffer.allocUnsafe(length);
-    for (let index = 0; index < length; index += 1) {
-        payload[index] = buffer[offset + index] ^ mask[index % 4];
-    }
-    return { fin, opcode, payload, bytesConsumed: offset + length };
+function validHex(value, length) {
+    return new RegExp(`^[a-f0-9]{${length}}$`).test(value);
 }
 
-function encodeServerFrame(opcode, payload) {
+function keyFor(roomId, proof) {
+    return `${roomId}:${proof}`;
+}
+
+function encodeFrame(opcode, payload) {
     const length = payload.length;
     let header;
-    if (length < 126) {
-        header = Buffer.from([0x80 | opcode, length]);
-    } else if (length <= 0xffff) {
+    if (length <= 125) {
+        header = Buffer.alloc(2);
+        header[1] = length;
+    } else if (length <= 65_535) {
         header = Buffer.alloc(4);
-        header[0] = 0x80 | opcode;
         header[1] = 126;
         header.writeUInt16BE(length, 2);
     } else {
         header = Buffer.alloc(10);
-        header[0] = 0x80 | opcode;
         header[1] = 127;
         header.writeBigUInt64BE(BigInt(length), 2);
     }
+    header[0] = 0x80 | opcode;
     return Buffer.concat([header, payload]);
 }
 
-function rejectUpgrade(socket, statusCode, statusText) {
-    if (socket.writable) {
-        socket.end(
-            `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
-            "Connection: close\r\n" +
-            "Cache-Control: no-store\r\n" +
-            "Content-Length: 0\r\n\r\n"
-        );
-    } else {
+function rejectUpgrade(socket, status, reason) {
+    try {
+        socket.end([
+            `HTTP/1.1 ${status} ${reason}`,
+            "Connection: close",
+            "Content-Length: 0",
+            "\r\n"
+        ].join("\r\n"));
+    } catch {
         socket.destroy();
     }
 }
 
 if (require.main === module) {
     const port = boundedInteger(process.env.PORT, 8080, 1, 65_535);
-    const relay = createRelayServer();
-    relay.once("error", () => process.exit(1));
-    relay.listen(port, "0.0.0.0");
-
-    const stop = () => {
-        relay.closeAll();
-        relay.close(() => process.exit(0));
-        setTimeout(() => process.exit(0), 2_000).unref();
-    };
-    process.once("SIGTERM", stop);
-    process.once("SIGINT", stop);
+    createRelayServer().listen(port, "0.0.0.0");
 }
 
 module.exports = { createRelayServer };

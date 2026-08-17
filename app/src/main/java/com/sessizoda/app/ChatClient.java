@@ -14,11 +14,17 @@ import okhttp3.WebSocketListener;
 
 final class ChatClient {
     interface Listener {
-        void onJoined(boolean mediaSupported, boolean notificationSupported);
+        void onJoined(
+                boolean mediaSupported,
+                boolean notificationSupported,
+                boolean advancedSupported
+        );
 
         void onPresence(int count);
 
         void onCipher(String kind, String payload);
+
+        void onAccepted(String messageId, int recipients);
 
         void onError(String message);
 
@@ -36,6 +42,7 @@ final class ChatClient {
     private volatile WebSocket webSocket;
     private volatile boolean manualClose;
     private volatile boolean mediaSupported;
+    private volatile boolean advancedSupported;
 
     ChatClient(
             String serverUrl,
@@ -48,14 +55,14 @@ final class ChatClient {
         this.authProof = authProof;
         this.clientId = clientId;
         this.listener = listener;
-        this.httpClient = new OkHttpClient.Builder()
+        httpClient = new OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .writeTimeout(15, TimeUnit.SECONDS)
                 .pingInterval(20, TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
                 .build();
-        this.request = new Request.Builder().url(serverUrl).build();
+        request = new Request.Builder().url(serverUrl).build();
     }
 
     void connect() {
@@ -69,6 +76,7 @@ final class ChatClient {
                     join.put("proof", authProof);
                     join.put("client", clientId);
                     join.put("media", 1);
+                    join.put("features", 1);
                     if (!socket.send(join.toString())) {
                         failProtocol("Sunucuya katılım isteği gönderilemedi.");
                     }
@@ -95,27 +103,39 @@ final class ChatClient {
             @Override
             public void onFailure(WebSocket socket, Throwable throwable, Response response) {
                 if (!manualClose) {
-                    listener.onError("Bağlantı kurulamadı veya kesildi. Sunucu adresini ve interneti kontrol edin.");
+                    listener.onError(
+                            "Bağlantı kurulamadı veya kesildi. Sunucu adresini ve interneti kontrol edin."
+                    );
                 }
                 finish();
             }
         });
     }
 
-    boolean sendCipher(String kind, String payload) {
-        return sendCipher(kind, null, payload);
+    boolean sendCipher(String kind, String payload, String messageId) {
+        return sendCipher(kind, null, payload, messageId);
     }
 
-    boolean sendMediaCipher(String stage, String payload) {
-        return sendCipher("media", stage, payload);
+    boolean sendMediaCipher(String stage, String payload, String messageId) {
+        return sendCipher("media", stage, payload, messageId);
     }
 
-    private boolean sendCipher(String kind, String stage, String payload) {
+    boolean sendReceiptCipher(String payload) {
+        return advancedSupported && sendCipher("receipt", null, payload, null);
+    }
+
+    private boolean sendCipher(
+            String kind,
+            String stage,
+            String payload,
+            String messageId
+    ) {
         WebSocket socket = webSocket;
         if (
                 socket == null ||
                 terminated.get() ||
-                ("media".equals(kind) && !mediaSupported)
+                ("media".equals(kind) && !mediaSupported) ||
+                ("receipt".equals(kind) && !advancedSupported)
         ) {
             return false;
         }
@@ -125,6 +145,9 @@ final class ChatClient {
             message.put("kind", kind);
             if (stage != null) {
                 message.put("stage", stage);
+            }
+            if (messageId != null && advancedSupported) {
+                message.put("id", messageId);
             }
             message.put("payload", payload);
             return socket.send(message.toString());
@@ -154,35 +177,51 @@ final class ChatClient {
             JSONObject message = new JSONObject(text);
             String type = message.optString("type", "");
             switch (type) {
-                case "joined":
+                case "joined": {
                     int protocol = message.optInt("protocol", 1);
-                    mediaSupported =
-                            protocol >= 2 &&
-                            message.optInt("media", 0) == 1;
+                    mediaSupported = protocol >= 2 && message.optInt("media", 0) == 1;
                     boolean notificationSupported =
-                            protocol >= 3 &&
-                            message.optInt("notifications", 0) == 1;
-                    listener.onJoined(mediaSupported, notificationSupported);
+                            protocol >= 3 && message.optInt("notifications", 0) == 1;
+                    advancedSupported =
+                            protocol >= 4 && message.optInt("receipts", 0) == 1;
+                    listener.onJoined(
+                            mediaSupported,
+                            notificationSupported,
+                            advancedSupported
+                    );
                     break;
-                case "presence":
+                }
+                case "presence": {
                     int count = message.optInt("count", 0);
                     if (count >= 0 && count <= 100) {
                         listener.onPresence(count);
                     }
                     break;
-                case "cipher":
+                }
+                case "cipher": {
                     String kind = message.optString("kind", "text");
                     String payload = message.optString("payload", "");
                     int payloadLimit = "media".equals(kind) ? 32_000 : 12_000;
                     if (
-                            ("text".equals(kind) || "media".equals(kind)) &&
+                            ("text".equals(kind) ||
+                                    "media".equals(kind) ||
+                                    "receipt".equals(kind)) &&
                             !payload.isEmpty() &&
                             payload.length() <= payloadLimit
                     ) {
                         listener.onCipher(kind, payload);
                     }
                     break;
-                case "error":
+                }
+                case "accepted": {
+                    String messageId = message.optString("id", "");
+                    int recipients = message.optInt("recipients", -1);
+                    if (messageId.matches("^[a-f0-9]{32}$") && recipients >= 0 && recipients <= 100) {
+                        listener.onAccepted(messageId, recipients);
+                    }
+                    break;
+                }
+                case "error": {
                     String code = message.optString("code", "");
                     listener.onError(mapServerError(code));
                     if (isFatalServerError(code)) {
@@ -192,6 +231,7 @@ final class ChatClient {
                         }
                     }
                     break;
+                }
                 default:
                     failProtocol("Sunucudan geçersiz yanıt alındı.");
                     break;
@@ -205,12 +245,12 @@ final class ChatClient {
         switch (code) {
             case "room_full":
                 return "Bu oda dolu.";
-            case "rate_limited":
-                return "Sunucu yoğunluğu nedeniyle bir paket atlandı; bağlantı açık kaldı.";
             case "session_replaced":
                 return "Bu cihazdaki eski bağlantının yerini yeni oturum aldı.";
             case "join_required":
                 return "Sunucu katılım isteğini kabul etmedi.";
+            case "invalid_message":
+                return "Sunucu geçersiz bir mesaj paketini atladı.";
             default:
                 return "Sunucu isteği reddetti.";
         }
